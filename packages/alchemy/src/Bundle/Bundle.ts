@@ -241,6 +241,7 @@ export const build = (
             pass: 3,
           },
         },
+        checks: { invalidAnnotation: false },
       });
       const result = await bundle.write(withDceDefault(outputOptions));
       await bundle.close();
