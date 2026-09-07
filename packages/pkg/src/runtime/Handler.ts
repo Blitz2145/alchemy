@@ -140,28 +140,52 @@ const renderInstalls = (
     groups.set(pkg.group, [...(groups.get(pkg.group) ?? []), pkg.name]);
   }
   const short = run.headSha.slice(0, SHORT);
+  // The main package leads its group; the rest stay alphabetical.
+  const ordered = (names: string[]) =>
+    [...names].sort(
+      (a, b) =>
+        Number(b === "alchemy") - Number(a === "alchemy") || a.localeCompare(b),
+    );
   return [...groups]
     .flatMap(([group, names]) => [
       `### ${group}`,
       "",
-      ...names.flatMap((name) => {
-        const url = `${origin}/${encodeName(name)}/${short}`;
-        return [
-          `**${name}**`,
-          "```sh",
-          `bun add ${url}`,
-          `pnpm install ${url}`,
-          "```",
-          "",
-        ];
-      }),
+      ...ordered(names).flatMap((name) => [
+        `**${name}**`,
+        "```sh",
+        `pnpm install ${origin}/${encodeName(name)}/${short}`,
+        "```",
+        "",
+      ]),
     ])
     .join("\n");
 };
 
-/** `2026-09-07 14:04 UTC`: GitHub renders no live timestamps in markdown. */
-const formatUtc = (millis: number) =>
-  new Date(millis).toISOString().replace("T", " ").slice(0, 16) + " UTC";
+/**
+ * GitHub's `<relative-time>` element, rendered as a live relative time in
+ * comments, with a plain UTC fallback like `Sep 7, 2026 2:42pm UTC`.
+ */
+const relativeTime = (millis: number) => {
+  const date = new Date(millis);
+  const months = [
+    "Jan",
+    "Feb",
+    "Mar",
+    "Apr",
+    "May",
+    "Jun",
+    "Jul",
+    "Aug",
+    "Sep",
+    "Oct",
+    "Nov",
+    "Dec",
+  ];
+  const hours = date.getUTCHours();
+  const clock = `${hours % 12 || 12}:${String(date.getUTCMinutes()).padStart(2, "0")}${hours < 12 ? "am" : "pm"}`;
+  const label = `${months[date.getUTCMonth()]} ${date.getUTCDate()}, ${date.getUTCFullYear()} ${clock} UTC`;
+  return `<relative-time datetime="${date.toISOString()}">${label}</relative-time>`;
+};
 
 const renderComment = (
   origin: string,
@@ -175,7 +199,7 @@ const renderComment = (
     "Install the packages built from this commit:",
     "",
     renderInstalls(origin, run, packages),
-    `Published ${formatUtc(times.publishedAt)}. Expires ${formatUtc(times.expiresAt)}, extended while this pull request is open.`,
+    `Published ${relativeTime(times.publishedAt)}. Expires ${relativeTime(times.expiresAt)}, extended while this pull request is open.`,
   ].join("\n");
 
 const CHECK_NAME = "Preview packages";
