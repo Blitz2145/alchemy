@@ -1,4 +1,3 @@
-import { DefaultArtifactClient } from "@actions/artifact";
 import * as Console from "effect/Console";
 import * as Data from "effect/Data";
 import * as Effect from "effect/Effect";
@@ -8,10 +7,8 @@ import * as Schema from "effect/Schema";
 import * as HttpClient from "effect/unstable/http/HttpClient";
 import * as HttpClientRequest from "effect/unstable/http/HttpClientRequest";
 import type * as HttpClientResponse from "effect/unstable/http/HttpClientResponse";
-import { createHash } from "node:crypto";
 import {
   ErrorResponse,
-  manifestArtifactName,
   MissingResponse,
   PublishRequest,
   PublishResponse,
@@ -20,14 +17,18 @@ import {
   TarballResponse,
   tarballPath,
 } from "../Api.ts";
-import { MANIFEST_FILE, type Manifest } from "../Manifest.ts";
-import { pack, type PackOptions } from "./pack.ts";
+import { MANIFEST_FILE, ManifestJson, type Manifest } from "../Manifest.ts";
 
 export class PublishError extends Data.TaggedError("PublishError")<{
   readonly message: string;
 }> {}
 
-export type PublishOptions = PackOptions;
+export interface PublishOptions {
+  readonly cwd: string;
+  /** Directory written by `pkg pack`. */
+  readonly dir: string;
+  readonly registry: string;
+}
 
 /**
  * The GitHub Actions run this job belongs to, from the runner's environment.
@@ -43,31 +44,6 @@ const currentRun = Effect.gen(function* () {
   }
   return { repo, runId, attempt };
 });
-
-/**
- * Vouch for the manifest by uploading it as an artifact of this run. Only
- * this job holds the runtime token that can do that, and the registry reads
- * the artifact list back through the GitHub API, so the artifact is the
- * proof that this run, and not someone merely naming it, submitted these
- * package hashes.
- */
-const vouch = (manifestPath: string, dir: string, sha256: string) =>
-  Effect.tryPromise({
-    try: async () => {
-      const client = new DefaultArtifactClient();
-      const result = await client.uploadArtifact(
-        manifestArtifactName(sha256),
-        [manifestPath],
-        dir,
-        { retentionDays: 1 },
-      );
-      return result.id;
-    },
-    catch: (cause) =>
-      new PublishError({
-        message: `could not upload the manifest artifact to this run: ${cause}`,
-      }),
-  });
 
 const bodyJson = (
   what: string,
@@ -108,10 +84,11 @@ const decodeResponse = <S extends Schema.Top>(
   });
 
 /**
- * Pack the workspace and publish it from the current GitHub Actions job.
- * The manifest is uploaded as an artifact of the run first; the registry
- * verifies that artifact through GitHub, then either reports the tarballs it
- * lacks, which are uploaded before trying again, or writes the tags.
+ * Publish a `pkg pack` directory from the current GitHub Actions job. The
+ * workflow must first have uploaded the manifest as an artifact of the run
+ * under the name `pkg pack` printed; the registry verifies that artifact
+ * through GitHub, then either reports the tarballs it lacks, which are
+ * uploaded before trying again, or writes the tags.
  */
 export const publish = Effect.fn("publish")(function* (
   options: PublishOptions,
@@ -122,19 +99,15 @@ export const publish = Effect.fn("publish")(function* (
   const registry = options.registry.replace(/\/+$/, "");
   const run = yield* currentRun;
 
-  const manifest = yield* pack(options);
-  if (manifest === undefined) return undefined;
-  const dir = path.resolve(options.cwd, options.out);
-  const manifestPath = path.join(dir, MANIFEST_FILE);
-  const manifestText = yield* fs.readFileString(manifestPath);
-  const manifestSha = yield* Effect.sync(() =>
-    createHash("sha256").update(manifestText).digest("hex"),
-  );
-
-  yield* vouch(manifestPath, dir, manifestSha);
-  yield* Console.log(
-    `Vouched for the manifest as artifact ${manifestArtifactName(manifestSha)}`,
-  );
+  const dir = path.resolve(options.cwd, options.dir);
+  const manifestText = yield* fs.readFileString(path.join(dir, MANIFEST_FILE));
+  const manifest =
+    yield* Schema.decodeUnknownEffect(ManifestJson)(manifestText);
+  if (manifest.registry !== registry) {
+    return yield* new PublishError({
+      message: `artifact was packed for ${manifest.registry}, not ${registry}`,
+    });
+  }
 
   const send = (request: HttpClientRequest.HttpClientRequest) =>
     http

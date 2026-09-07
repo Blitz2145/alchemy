@@ -8,14 +8,14 @@ Install URLs look like `https://pkg.ing/<name>@<tag>` where `<tag>` is a commit 
 
 Every publication is a GitHub Actions **run**. The registry never trusts what a client says about commits, branches, or pull requests; it resolves the run through the GitHub API and derives every tag from that.
 
-1. One workflow runs on `push` and `pull_request`, builds the workspace, and runs `pkg publish`, which packs and publishes from the same job. It needs no permissions and no secrets, so fork pull requests run it exactly like everything else.
-2. Before talking to the registry, the CLI uploads the manifest it is about to send as an artifact of its own run, named `pkg-manifest-<sha256 of the manifest>`. Only the job's runtime token can add artifacts to the run, so that artifact is GitHub's record that this run vouched for exactly these package hashes.
+1. One workflow runs on `push` and `pull_request`, builds the workspace, runs `pkg pack`, uploads the manifest as an artifact with `actions/upload-artifact`, and runs `pkg publish`. It needs no permissions and no secrets, so fork pull requests run it exactly like everything else.
+2. `pkg pack` prints the artifact name, `pkg-manifest-<sha256 of the manifest>`, as a step output for the upload. Only the job's runtime token can add artifacts to the run, and the runner exposes that token to actions alone, which is why the upload is its own step. The artifact is GitHub's record that this run vouched for exactly these package hashes.
 3. Requests carry the run as a hint (`owner/repo#<run id>:<attempt>`) and nothing else. The registry fetches the run through the App, requires it to be in progress, lists its artifacts, and refuses any manifest whose hash is not vouched for. Someone naming another run can only ever get that run's own manifest accepted, which changes nothing.
 4. One idempotent `POST /api/publish` either answers 409 with the tarballs it lacks, which the CLI uploads before publishing again, or points the tags, posts a "Preview packages" check run on the commit, and for pull requests updates the comment. The App needs `checks: write`, `pull_requests: write`, and `actions: read`.
 
 ## `pkg publish` and `pkg pack`
 
-`pkg publish` takes the same flags as `pack`, packs into `--out`, and publishes the result from the current job. `pack` alone is useful to inspect what would be published.
+`pkg publish --dir .pkg` publishes what `pack` wrote, from the current job, once the workflow has uploaded the manifest artifact. `pack` alone is useful to inspect what would be published.
 
 ```sh
 pkg pack \

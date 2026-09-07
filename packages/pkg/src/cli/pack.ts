@@ -3,12 +3,14 @@ import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
+import { createHash } from "node:crypto";
 import {
   MANIFEST_FILE,
   ManifestJson,
   type Manifest,
   type ManifestPackage,
 } from "../Manifest.ts";
+import { manifestArtifactName } from "../Api.ts";
 import * as Git from "./git.ts";
 import { packPackage } from "./tarball.ts";
 import { discover, WorkspaceError, type Group } from "./workspace.ts";
@@ -116,12 +118,27 @@ export const pack = Effect.fn("pack")(function* (options: PackOptions) {
     head,
     packages: entries,
   };
-  yield* fs.writeFileString(
-    path.join(outDir, MANIFEST_FILE),
-    `${Schema.encodeSync(ManifestJson)(manifest)}\n`,
-  );
+  const manifestText = `${Schema.encodeSync(ManifestJson)(manifest)}\n`;
+  yield* fs.writeFileString(path.join(outDir, MANIFEST_FILE), manifestText);
   yield* Console.log(
     `Packed ${entries.length} package(s) into ${path.relative(options.cwd, outDir) || "."}`,
   );
+
+  // The workflow uploads the manifest as an artifact under this name; that
+  // upload is what proves to the registry that this run vouched for it.
+  // Only a JavaScript action receives the runtime token needed to upload,
+  // so the CLI cannot do it itself.
+  const artifact = manifestArtifactName(
+    yield* Effect.sync(() =>
+      createHash("sha256").update(manifestText).digest("hex"),
+    ),
+  );
+  const output = process.env.GITHUB_OUTPUT;
+  if (output) {
+    yield* fs.writeFileString(output, `artifact-name=${artifact}\n`, {
+      flag: "a",
+    });
+  }
+  yield* Console.log(`Manifest artifact name: ${artifact}`);
   return manifest;
 });

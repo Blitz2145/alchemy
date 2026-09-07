@@ -54,25 +54,24 @@ export const packCommand = Command.make(
   ]),
 );
 
+const dirFlag = Flag.string("dir").pipe(
+  Flag.withDescription("Directory written by pkg pack"),
+  Flag.withDefault(".pkg"),
+);
+
 export const publishCommand = Command.make(
   "publish",
-  { group: groupFlag, registry: registryFlag, out: outFlag },
-  ({ group, registry, out }) =>
+  { registry: registryFlag, dir: dirFlag },
+  ({ registry, dir }) =>
     Effect.gen(function* () {
-      const groups = yield* parseGroups(group);
       const cwd = yield* Effect.sync(() => process.cwd());
-      yield* publish({ cwd, groups, registry, out });
+      yield* publish({ cwd, dir, registry });
     }),
 ).pipe(
   Command.withDescription(
-    "Pack workspace packages and publish them to the registry from the current GitHub Actions job",
+    "Publish a pkg pack directory from the current GitHub Actions job, after its manifest artifact has been uploaded",
   ),
-  Command.withExamples([
-    {
-      command:
-        "pkg publish --group Alchemy=./packages/* --group Distilled=./submodules/distilled/packages/*",
-    },
-  ]),
+  Command.withExamples([{ command: "pkg publish --registry https://pkg.ing" }]),
 );
 
 export const root = Command.make("pkg", {}, () =>
