@@ -1,0 +1,86 @@
+{
+  "name": "@alchemy.run/pkg",
+  "version": "2.0.0-beta.76",
+  "description": "Preview package registry for pull requests. A Cloudflare Worker authenticated by GitHub Actions OIDC plus a CLI that packs and publishes workspace packages.",
+  "homepage": "https://alchemy.run",
+  "license": "Apache-2.0",
+  "author": "Sam Goodwin <sam@alchemy.run>",
+  "keywords": [
+    "alchemy",
+    "cloudflare",
+    "effect",
+    "preview-packages",
+    "pull-request"
+  ],
+  "type": "module",
+  "sideEffects": false,
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/alchemy-run/alchemy.git",
+    "directory": "packages/pkg"
+  },
+  "bugs": {
+    "url": "https://github.com/alchemy-run/alchemy/issues"
+  },
+  "bin": {
+    "pkg": "./lib/cli/bin.js"
+  },
+  "files": [
+    "lib",
+    "migrations",
+    "src",
+    "LICENSE",
+    "NOTICE"
+  ],
+  "scripts": {
+    "build": "tsc -b && bun ../../scripts/copy-package-files.ts pkg",
+    "test": "bun test ./test"
+  },
+  "exports": {
+    ".": {
+      "types": "./lib/index.d.ts",
+      "bun": "./src/index.ts",
+      "worker": "./src/index.ts",
+      "import": "./lib/index.js"
+    },
+    "./Manifest": {
+      "types": "./lib/Manifest.d.ts",
+      "bun": "./src/Manifest.ts",
+      "worker": "./src/Manifest.ts",
+      "import": "./lib/Manifest.js"
+    },
+    "./Policy": {
+      "types": "./lib/Policy.d.ts",
+      "bun": "./src/Policy.ts",
+      "worker": "./src/Policy.ts",
+      "import": "./lib/Policy.js"
+    }
+  },
+  "dependencies": {
+    "@distilled.cloud/github": "workspace:*",
+    "alchemy": "workspace:*",
+    "effect": "catalog:effect",
+    "modern-tar": "^0.8.4"
+  },
+  "peerDependencies": {
+    "@effect/platform-bun": "catalog:effect",
+    "@effect/platform-node": "catalog:effect"
+  },
+  "peerDependenciesMeta": {
+    "@effect/platform-bun": {
+      "optional": true
+    },
+    "@effect/platform-node": {
+      "optional": true
+    }
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "devDependencies": {
+    "@effect/platform-bun": "catalog:effect",
+    "@effect/platform-node": "catalog:effect",
+    "@types/bun": "catalog:tooling",
+    "typescript": "catalog:build"
+  }
+}

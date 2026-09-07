@@ -1,0 +1,38 @@
+import * as Schema from "effect/Schema";
+
+/**
+ * Registry policy. Plain data: it is validated when the Registry is defined
+ * and captured in the Worker bundle, so it must not contain functions.
+ */
+export const Policy = Schema.Struct({
+  /**
+   * Repositories allowed to publish, as `owner/name`. A publication may
+   * contain any package; every package gets the commit, short commit,
+   * `branch:` and `pr:` tags of the run that produced it.
+   */
+  repos: Schema.Array(Schema.String),
+  /**
+   * How long a publication lives: from the push for branch publications,
+   * from close or merge for pull request publications. Publishing the same
+   * content again refreshes the clock.
+   * @default Duration.weeks(1)
+   */
+  ttl: Schema.optionalKey(Schema.Duration),
+  /** Upper bound on a single tarball, in bytes. Absent means unlimited. */
+  maxPackageSize: Schema.optionalKey(Schema.Number),
+  /**
+   * File name of the publish workflow. Only OIDC tokens whose
+   * `job_workflow_ref` is this file on the repository's `main` branch may
+   * publish.
+   * @default "pkg-publish.yml"
+   */
+  workflow: Schema.optionalKey(Schema.String),
+});
+export type Policy = typeof Policy.Type;
+export type PolicyInput = typeof Policy.Encoded;
+
+export const DEFAULT_WORKFLOW = "pkg-publish.yml";
+
+/** The `job_workflow_ref` claim allowed to publish for `repo`. */
+export const publishWorkflowRef = (policy: Policy, repo: string) =>
+  `${repo}/.github/workflows/${policy.workflow ?? DEFAULT_WORKFLOW}@refs/heads/main`;

@@ -1,0 +1,90 @@
+name: Package Preview Build
+
+# Builds and packs every publishable workspace package into an artifact.
+# Nothing here talks to the registry: `pkg-publish.yml` picks the artifact up
+# on `workflow_run` and publishes it with the repository's OIDC identity.
+# Fork pull requests run here too, which is exactly why this job has no
+# permissions and no secrets.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "submodules/distilled"
+      - "packages/**"
+      - "scripts/**"
+      - "package.json"
+      - "pnpm-lock.yaml"
+      - "pnpm-workspace.yaml"
+      - "turbo.json"
+      - "tsconfig.json"
+      - ".github/workflows/pkg-build.yml"
+  pull_request:
+    paths:
+      - "submodules/distilled"
+      - "packages/**"
+      - "scripts/**"
+      - "package.json"
+      - "pnpm-lock.yaml"
+      - "pnpm-workspace.yaml"
+      - "turbo.json"
+      - "tsconfig.json"
+      - ".github/workflows/pkg-build.yml"
+
+permissions: {}
+
+concurrency:
+  group: pkg-build-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  pack:
+    name: Pack preview packages
+    runs-on: blacksmith-8vcpu-ubuntu-2404
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Pack the pull request head rather than the synthetic merge commit,
+          # so every tarball is addressed by a commit that exists on the PR and
+          # the registry can verify it against the run.
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+
+      - name: Checkout distilled
+        run: git submodule update --init --depth=1 --checkout -- submodules/distilled
+
+      - name: Restore Turbo cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .turbo
+          key: turbo-${{ runner.os }}-${{ github.repository_id }}-${{ github.sha }}-${{ github.workflow }}-${{ github.run_attempt }}
+          restore-keys: |
+            turbo-${{ runner.os }}-${{ github.repository_id }}-${{ github.sha }}-
+            turbo-${{ runner.os }}-${{ github.repository_id }}-
+
+      - name: Setup pnpm, Node.js, Bun and install dependencies
+        uses: pnpm/setup@703c52620218391530e48b9e8870d5c0082e1b9b # v2.1.0
+        with:
+          cache: true
+          install: true
+          require-lockfile: true
+
+      - name: Build packages
+        run: pnpm build:pkg
+
+      # Keep the directory lists in sync with the `build:pkg` script.
+      - name: Pack packages
+        run: >-
+          bun packages/pkg/src/cli/bin.ts pack
+          --group 'Alchemy=./packages/{alchemy,better-auth,cloudflare-runtime,frontend-frameworks,node-utils,floci,pkg}'
+          --group 'Distilled=./submodules/distilled/packages/{core,aws,axiom,cloudflare,fly-io,hetzner,neon,planetscale,railway}'
+          --registry https://staging.pkg.ing
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: pkg-preview
+          path: .pkg
+          if-no-files-found: error
+          # The registry holds the real copy; the artifact is only a hand-off.
+          retention-days: 1
