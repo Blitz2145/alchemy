@@ -23,9 +23,10 @@
     "url": "https://github.com/alchemy-run/alchemy/issues"
   },
   "bin": {
-    "pkg": "./lib/cli/bin.js"
+    "pkg": "./bin/pkg.mjs"
   },
   "files": [
+    "bin",
     "lib",
     "migrations",
     "src",

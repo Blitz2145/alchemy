@@ -1,4 +1,3 @@
-#!/usr/bin/env node
 import { PlatformServices, runMain } from "alchemy/Util/PlatformServices";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
