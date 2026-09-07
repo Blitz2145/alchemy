@@ -85,6 +85,9 @@ jobs:
         with:
           name: pkg-preview
           path: .pkg
+          # The output directory is dot-prefixed, which upload-artifact
+          # treats as hidden and skips by default.
+          include-hidden-files: true
           if-no-files-found: error
           # The registry holds the real copy; the artifact is only a hand-off.
           retention-days: 1
