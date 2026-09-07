@@ -159,10 +159,15 @@ const renderInstalls = (
     .join("\n");
 };
 
+/** `2026-09-07 14:04 UTC`: GitHub renders no live timestamps in markdown. */
+const formatUtc = (millis: number) =>
+  new Date(millis).toISOString().replace("T", " ").slice(0, 16) + " UTC";
+
 const renderComment = (
   origin: string,
   run: Run,
   packages: ReadonlyArray<{ name: string; group: string }>,
+  times: { readonly publishedAt: number; readonly expiresAt: number },
 ) =>
   [
     COMMENT_MARKER,
@@ -170,6 +175,7 @@ const renderComment = (
     "Install the packages built from this commit:",
     "",
     renderInstalls(origin, run, packages),
+    `Published ${formatUtc(times.publishedAt)}. Expires ${formatUtc(times.expiresAt)}, extended while this pull request is open.`,
   ].join("\n");
 
 const CHECK_NAME = "Preview packages";
@@ -391,7 +397,10 @@ export const make = (config: RegistryConfig) =>
           ),
         );
         if (run.pr !== null) {
-          const body = renderComment(origin, run, packages);
+          const body = renderComment(origin, run, packages, {
+            publishedAt: now,
+            expiresAt,
+          });
           yield* GitHub.upsertComment(
             gh,
             run.repo,
