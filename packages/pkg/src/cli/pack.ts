@@ -111,7 +111,7 @@ export const pack = Effect.fn("pack")(function* (options: PackOptions) {
   yield* fs.makeDirectory(outDir, { recursive: true });
 
   const links = new Map<string, string>();
-  const entries: ManifestPackage[] = [];
+  const packedByName = new Map<string, ManifestPackage>();
   for (const level of levels) {
     const packedLevel = yield* Effect.forEach(
       level,
@@ -145,9 +145,11 @@ export const pack = Effect.fn("pack")(function* (options: PackOptions) {
         entry.name,
         tarballUrl(options.registry, entry.name, entry.sha256),
       );
-      entries.push(entry);
+      packedByName.set(entry.name, entry);
     }
   }
+  // Packing ran in dependency order; the manifest keeps the listed order.
+  const entries = packages.map((pkg) => packedByName.get(pkg.name)!);
 
   const manifest: Manifest = {
     version: 1,

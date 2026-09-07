@@ -160,9 +160,11 @@ const expandPattern = Effect.fn("expandPattern")(function* (
 });
 
 /**
- * Discover publishable packages under each group's pattern. Private packages
- * and directories without a named `package.json` are skipped. A package
- * name appearing under two groups is an error.
+ * Discover publishable packages under each group's pattern, in the order the
+ * groups and their directories were given, which is the order they are
+ * listed in. Private packages and directories without a named
+ * `package.json` are skipped. A package name appearing under two groups is
+ * an error.
  */
 export const discover = Effect.fn("discoverPackages")(function* (
   cwd: string,
@@ -193,5 +195,5 @@ export const discover = Effect.fn("discoverPackages")(function* (
       });
     }
   }
-  return [...found.values()].sort((a, b) => a.name.localeCompare(b.name));
+  return [...found.values()];
 });

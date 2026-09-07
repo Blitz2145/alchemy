@@ -140,17 +140,13 @@ const renderInstalls = (
     groups.set(pkg.group, [...(groups.get(pkg.group) ?? []), pkg.name]);
   }
   const short = run.headSha.slice(0, SHORT);
-  // The main package leads its group; the rest stay alphabetical.
-  const ordered = (names: string[]) =>
-    [...names].sort(
-      (a, b) =>
-        Number(b === "alchemy") - Number(a === "alchemy") || a.localeCompare(b),
-    );
+  // Packages appear in the order the manifest lists them, which is the
+  // order they were given to `pkg pack`.
   return [...groups]
     .flatMap(([group, names]) => [
       `### ${group}`,
       "",
-      ...ordered(names).flatMap((name) => [
+      ...names.flatMap((name) => [
         `**${name}**`,
         "```sh",
         `pnpm install ${origin}/${encodeName(name)}/${short}`,
