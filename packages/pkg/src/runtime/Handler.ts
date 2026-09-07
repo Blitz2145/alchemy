@@ -105,8 +105,9 @@ const parseInstallPath = (
 const qualify = (name: string, scope: string | undefined) =>
   scope !== undefined && !name.startsWith("@") ? `${scope}/${name}` : name;
 
-const encodeName = (name: string) =>
-  name.split("/").map(encodeURIComponent).join("/");
+// Package names are already URL-safe apart from `@` and `/`, both of which
+// npm clients and the router expect verbatim, so URLs use the name as is.
+const encodeName = (name: string) => name;
 
 /**
  * Tags every package in a publication receives, all derived from the run:
@@ -126,7 +127,7 @@ const tagsFor = (run: Run): string[] => {
   return tags;
 };
 
-/** Grouped `bun add` lines pinned to the run's short commit. */
+/** Install commands per package, grouped, pinned to the run's short commit. */
 const renderInstalls = (
   origin: string,
   run: Run,
@@ -140,10 +141,18 @@ const renderInstalls = (
   return [...groups]
     .flatMap(([group, names]) => [
       `### ${group}`,
-      "```sh",
-      ...names.map((name) => `bun add ${origin}/${encodeName(name)}@${short}`),
-      "```",
       "",
+      ...names.flatMap((name) => {
+        const url = `${origin}/${encodeName(name)}@${short}`;
+        return [
+          `**${name}**`,
+          "```sh",
+          `bun add ${url}`,
+          `pnpm install ${url}`,
+          "```",
+          "",
+        ];
+      }),
     ])
     .join("\n");
 };
@@ -155,7 +164,8 @@ const renderComment = (
 ) =>
   [
     COMMENT_MARKER,
-    `Preview packages for ${run.headSha.slice(0, SHORT)}:`,
+    "",
+    "Install the packages built from this commit:",
     "",
     renderInstalls(origin, run, packages),
   ].join("\n");
