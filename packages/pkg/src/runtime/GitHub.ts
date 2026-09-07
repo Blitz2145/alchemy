@@ -1,3 +1,8 @@
+import * as Data from "effect/Data";
+import * as Effect from "effect/Effect";
+import * as Encoding from "effect/Encoding";
+import * as Result from "effect/Result";
+import { COMMENT_MARKER } from "../Api.ts";
 import * as Github from "@distilled.cloud/github";
 import * as Actions from "@distilled.cloud/github/actions";
 import * as Apps from "@distilled.cloud/github/apps";
@@ -5,11 +10,180 @@ import * as Checks from "@distilled.cloud/github/checks";
 import * as Issues from "@distilled.cloud/github/issues";
 import * as Pulls from "@distilled.cloud/github/pulls";
 import * as Repos from "@distilled.cloud/github/repos";
-import * as Data from "effect/Data";
-import * as Effect from "effect/Effect";
+import * as Clock from "effect/Clock";
 import * as Redacted from "effect/Redacted";
 import * as HttpClient from "effect/unstable/http/HttpClient";
-import { signJwt } from "./Crypto.ts";
+
+export class CryptoError extends Data.TaggedError("CryptoError")<{
+  readonly message: string;
+}> {}
+
+const encoder = new TextEncoder();
+
+/** Lowercase hex SHA-256 of a string. */
+export const sha256Hex = (text: string) =>
+  Effect.promise(async () =>
+    Encoding.encodeHex(
+      new Uint8Array(
+        await crypto.subtle.digest("SHA-256", encoder.encode(text)),
+      ),
+    ),
+  );
+
+/** DER length prefix. */
+const derLength = (length: number): number[] => {
+  if (length < 0x80) return [length];
+  const bytes: number[] = [];
+  let remaining = length;
+  while (remaining > 0) {
+    bytes.unshift(remaining & 0xff);
+    remaining >>= 8;
+  }
+  return [0x80 | bytes.length, ...bytes];
+};
+
+/**
+ * Wrap a PKCS#1 `RSAPrivateKey` in a PKCS#8 `PrivateKeyInfo` so WebCrypto
+ * can import it. GitHub issues App keys in PKCS#1.
+ */
+const pkcs1ToPkcs8 = (pkcs1: Uint8Array): Uint8Array<ArrayBuffer> => {
+  // SEQUENCE { INTEGER 0, SEQUENCE { OID rsaEncryption, NULL }, OCTET STRING { pkcs1 } }
+  const algorithm = [
+    0x30, 0x0d, 0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01,
+    0x01, 0x05, 0x00,
+  ];
+  const octetString = [0x04, ...derLength(pkcs1.length)];
+  const version = [0x02, 0x01, 0x00];
+  const bodyLength =
+    version.length + algorithm.length + octetString.length + pkcs1.length;
+  return Uint8Array.from([
+    0x30,
+    ...derLength(bodyLength),
+    ...version,
+    ...algorithm,
+    ...octetString,
+    ...pkcs1,
+  ]);
+};
+
+/** Import an RSA private key PEM (PKCS#1 or PKCS#8) for RS256 signing. */
+export const importPrivateKey = (pem: string) =>
+  Effect.gen(function* () {
+    const match = pem.match(
+      /-----BEGIN (RSA )?PRIVATE KEY-----([\s\S]+?)-----END (RSA )?PRIVATE KEY-----/,
+    );
+    if (!match) {
+      return yield* new CryptoError({ message: "not an RSA private key PEM" });
+    }
+    const decoded = Encoding.decodeBase64(match[2]!.replace(/\s+/g, ""));
+    if (Result.isFailure(decoded)) {
+      return yield* new CryptoError({ message: "private key is not base64" });
+    }
+    const der = decoded.success;
+    const pkcs8 = match[1] ? pkcs1ToPkcs8(der) : Uint8Array.from(der);
+    return yield* Effect.tryPromise({
+      try: () =>
+        crypto.subtle.importKey(
+          "pkcs8",
+          pkcs8,
+          { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" },
+          false,
+          ["sign"],
+        ),
+      catch: (cause) =>
+        new CryptoError({ message: `invalid private key: ${cause}` }),
+    });
+  });
+
+/** Sign a compact RS256 JWT, used to authenticate as the GitHub App. */
+export const signJwt = (claims: Record<string, unknown>, key: CryptoKey) =>
+  Effect.tryPromise({
+    try: async () => {
+      const header = Encoding.encodeBase64Url(
+        JSON.stringify({ alg: "RS256", typ: "JWT" }),
+      );
+      const payload = Encoding.encodeBase64Url(JSON.stringify(claims));
+      const input = `${header}.${payload}`;
+      const signature = await crypto.subtle.sign(
+        "RSASSA-PKCS1-v1_5",
+        key,
+        encoder.encode(input),
+      );
+      return `${input}.${Encoding.encodeBase64Url(new Uint8Array(signature))}`;
+    },
+    catch: (cause) => new CryptoError({ message: `signing failed: ${cause}` }),
+  });
+
+const SHORT = 7;
+
+/** Install commands per package, grouped, pinned to the run's short commit. */
+export const renderInstalls = (
+  origin: string,
+  run: { readonly headSha: string },
+  packages: ReadonlyArray<{ name: string; group: string }>,
+) => {
+  const groups = new Map<string, string[]>();
+  for (const pkg of packages) {
+    groups.set(pkg.group, [...(groups.get(pkg.group) ?? []), pkg.name]);
+  }
+  const short = run.headSha.slice(0, SHORT);
+  // Packages appear in the order the manifest lists them, which is the
+  // order they were given to `pkg pack`.
+  return [...groups]
+    .flatMap(([group, names]) => [
+      `### ${group}`,
+      "",
+      ...names.flatMap((name) => [
+        `**${name}**`,
+        "```sh",
+        `pnpm install ${origin}/${name}/${short}`,
+        "```",
+        "",
+      ]),
+    ])
+    .join("\n");
+};
+
+/**
+ * GitHub's `<relative-time>` element, rendered as a live relative time in
+ * comments, with a plain UTC fallback like `Sep 7, 2026 2:42pm UTC`.
+ */
+const relativeTime = (millis: number) => {
+  const date = new Date(millis);
+  const months = [
+    "Jan",
+    "Feb",
+    "Mar",
+    "Apr",
+    "May",
+    "Jun",
+    "Jul",
+    "Aug",
+    "Sep",
+    "Oct",
+    "Nov",
+    "Dec",
+  ];
+  const hours = date.getUTCHours();
+  const clock = `${hours % 12 || 12}:${String(date.getUTCMinutes()).padStart(2, "0")}${hours < 12 ? "am" : "pm"}`;
+  const label = `${months[date.getUTCMonth()]} ${date.getUTCDate()}, ${date.getUTCFullYear()} ${clock} UTC`;
+  return `<relative-time datetime="${date.toISOString()}">${label}</relative-time>`;
+};
+
+export const renderComment = (
+  origin: string,
+  run: { readonly headSha: string },
+  packages: ReadonlyArray<{ name: string; group: string }>,
+  times: { readonly publishedAt: number; readonly expiresAt: number },
+) =>
+  [
+    COMMENT_MARKER,
+    "",
+    "Install the packages built from this commit:",
+    "",
+    renderInstalls(origin, run, packages),
+    `Published ${relativeTime(times.publishedAt)}. Expires ${relativeTime(times.expiresAt)}, extended while this pull request is open.`,
+  ].join("\n");
 
 export interface GitHubOptions {
   readonly http: HttpClient.HttpClient;
@@ -57,13 +231,13 @@ const as = <A, E, R>(
     Effect.provideService(HttpClient.HttpClient, options.http),
   );
 
-const appJwt = (options: GitHubOptions) => {
-  const now = Math.floor(Date.now() / 1000);
-  return signJwt(
+const appJwt = Effect.fn("GitHub.appJwt")(function* (options: GitHubOptions) {
+  const now = Math.floor((yield* Clock.currentTimeMillis) / 1000);
+  return yield* signJwt(
     { iat: now - 60, exp: now + 540, iss: options.appId },
     options.key,
   );
-};
+});
 
 // Installation tokens are cached per repository for the isolate's lifetime.
 const tokens = new Map<string, { token: string; expiresAt: number }>();
@@ -72,7 +246,10 @@ const tokens = new Map<string, { token: string; expiresAt: number }>();
 export const installationToken = (options: GitHubOptions, repo: string) =>
   Effect.gen(function* () {
     const cached = tokens.get(repo);
-    if (cached !== undefined && cached.expiresAt > Date.now() + 60_000) {
+    if (
+      cached !== undefined &&
+      cached.expiresAt > (yield* Clock.currentTimeMillis) + 60_000
+    ) {
       return cached.token;
     }
     const jwt = yield* appJwt(options);
@@ -163,7 +340,7 @@ export const getPullRequest = (
  * Publish a completed check run on `headSha`. GitHub shows the newest run
  * per name and App, so re-publishing the same commit simply supersedes it.
  */
-export const createCheckRun = (
+export const createCheckRun = Effect.fn("GitHub.createCheckRun")(function* (
   options: GitHubOptions,
   repo: string,
   input: {
@@ -173,8 +350,8 @@ export const createCheckRun = (
     readonly summary: string;
     readonly detailsUrl: string;
   },
-) =>
-  asInstallation(
+) {
+  return yield* asInstallation(
     options,
     repo,
     Checks.create({
@@ -183,11 +360,12 @@ export const createCheckRun = (
       head_sha: input.headSha,
       status: "completed",
       conclusion: "success",
-      completed_at: new Date().toISOString(),
+      completed_at: new Date(yield* Clock.currentTimeMillis).toISOString(),
       details_url: input.detailsUrl,
       output: { title: input.title, summary: input.summary },
     }),
   );
+});
 
 /** Create or update the comment on `issue` whose body starts with `marker`. */
 export const upsertComment = (

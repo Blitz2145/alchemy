@@ -45,16 +45,16 @@
       "import": "./lib/index.js"
     },
     "./Manifest": {
-      "types": "./lib/Manifest.d.ts",
-      "bun": "./src/Manifest.ts",
-      "worker": "./src/Manifest.ts",
-      "import": "./lib/Manifest.js"
+      "types": "./lib/Api.d.ts",
+      "bun": "./src/Api.ts",
+      "worker": "./src/Api.ts",
+      "import": "./lib/Api.js"
     },
     "./Policy": {
-      "types": "./lib/Policy.d.ts",
-      "bun": "./src/Policy.ts",
-      "worker": "./src/Policy.ts",
-      "import": "./lib/Policy.js"
+      "types": "./lib/Api.d.ts",
+      "bun": "./src/Api.ts",
+      "worker": "./src/Api.ts",
+      "import": "./lib/Api.js"
     }
   },
   "dependencies": {

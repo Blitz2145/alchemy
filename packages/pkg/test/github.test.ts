@@ -3,7 +3,8 @@ import * as Effect from "effect/Effect";
 import * as Encoding from "effect/Encoding";
 import * as Result from "effect/Result";
 import { generateKeyPairSync } from "node:crypto";
-import { importPrivateKey, sha256Hex, signJwt } from "../src/runtime/Crypto.ts";
+import { importPrivateKey, sha256Hex, signJwt } from "../src/runtime/GitHub.ts";
+import { renderComment, renderInstalls } from "../src/runtime/GitHub.ts";
 
 const keyPair = (type: "pkcs1" | "pkcs8") =>
   generateKeyPairSync("rsa", {
@@ -82,4 +83,51 @@ describe("Crypto", () => {
       createHash("sha256").update(text).digest("hex"),
     );
   });
+});
+
+const packages = [
+  { name: "alchemy", group: "Alchemy" },
+  { name: "@distilled.cloud/core", group: "Distilled" },
+  { name: "@alchemy.run/pkg", group: "Alchemy" },
+];
+const run = { headSha: "abcdef0123456789" };
+
+test("install commands preserve group and package order, scopes, and short commit", () => {
+  expect(renderInstalls("https://pkg.ing", run, packages)).toBe(
+    [
+      "### Alchemy",
+      "",
+      "**alchemy**",
+      "```sh",
+      "pnpm install https://pkg.ing/alchemy/abcdef0",
+      "```",
+      "",
+      "**@alchemy.run/pkg**",
+      "```sh",
+      "pnpm install https://pkg.ing/@alchemy.run/pkg/abcdef0",
+      "```",
+      "",
+      "### Distilled",
+      "",
+      "**@distilled.cloud/core**",
+      "```sh",
+      "pnpm install https://pkg.ing/@distilled.cloud/core/abcdef0",
+      "```",
+      "",
+    ].join("\n"),
+  );
+});
+
+test("comment retains live relative timestamps and UTC fallback at midnight and noon", () => {
+  const comment = renderComment("https://pkg.ing", run, packages, {
+    publishedAt: Date.parse("2026-09-07T00:05:00Z"),
+    expiresAt: Date.parse("2026-09-14T12:05:00Z"),
+  });
+  expect(comment).toContain(renderInstalls("https://pkg.ing", run, packages));
+  expect(comment).toContain(
+    'Published <relative-time datetime="2026-09-07T00:05:00.000Z">Sep 7, 2026 12:05am UTC</relative-time>.',
+  );
+  expect(comment).toContain(
+    'Expires <relative-time datetime="2026-09-14T12:05:00.000Z">Sep 14, 2026 12:05pm UTC</relative-time>, extended while this pull request is open.',
+  );
 });

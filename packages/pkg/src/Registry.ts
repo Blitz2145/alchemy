@@ -2,12 +2,8 @@ import * as Cloudflare from "alchemy/Cloudflare";
 import * as Config from "effect/Config";
 import type * as Redacted from "effect/Redacted";
 import * as Schema from "effect/Schema";
-import type { PolicyInput } from "./Policy.ts";
-import {
-  APP_ID_ENV,
-  PRIVATE_KEY_ENV,
-  RegistryConfig,
-} from "./runtime/Config.ts";
+import type { PolicyInput } from "./Api.ts";
+import { APP_ID_ENV, PRIVATE_KEY_ENV, RegistryConfig } from "./Api.ts";
 import { make } from "./runtime/Handler.ts";
 
 export interface RegistryProps {

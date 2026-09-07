@@ -1,26 +1,417 @@
-import * as Console from "effect/Console";
+import * as Data from "effect/Data";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
+import * as Stream from "effect/Stream";
+import * as ChildProcess from "effect/unstable/process/ChildProcess";
+import { ChildProcessSpawner } from "effect/unstable/process/ChildProcessSpawner";
+import { packTar, unpackTar, type TarHeader } from "modern-tar";
 import { createHash } from "node:crypto";
+import { gunzipSync, gzipSync } from "node:zlib";
+import * as Console from "effect/Console";
 import {
   MANIFEST_FILE,
   ManifestJson,
   type Manifest,
   type ManifestPackage,
-} from "../Manifest.ts";
+} from "../Api.ts";
 import { manifestArtifactName } from "../Api.ts";
-import * as Git from "./git.ts";
-import { packPackage, tarballUrl } from "./tarball.ts";
-import {
-  DEPENDENCY_SECTIONS,
-  DependencySections,
-  dependencyLevels,
-  discover,
-  WorkspaceError,
-  type Group,
-} from "./workspace.ts";
+
+export class WorkspaceError extends Data.TaggedError("WorkspaceError")<{
+  readonly message: string;
+}> {}
+
+/** A `NAME=GLOB` group flag, e.g. `Alchemy=./packages/*`. */
+export interface Group {
+  readonly name: string;
+  readonly pattern: string;
+}
+
+export const parseGroup = (spec: string): Group | undefined => {
+  const index = spec.indexOf("=");
+  if (index <= 0 || index === spec.length - 1) return undefined;
+  return {
+    name: spec.slice(0, index).trim(),
+    pattern: spec.slice(index + 1).trim(),
+  };
+};
+
+/** The subset of `package.json` the CLI reads. Extra keys are preserved on the raw object. */
+export const PackageJson = Schema.Struct({
+  name: Schema.optionalKey(Schema.String),
+  version: Schema.optionalKey(Schema.String),
+  private: Schema.optionalKey(Schema.Boolean),
+});
+
+export const DEPENDENCY_SECTIONS = [
+  "dependencies",
+  "devDependencies",
+  "peerDependencies",
+  "optionalDependencies",
+] as const;
+
+const DependencyMap = Schema.optionalKey(
+  Schema.Record(Schema.String, Schema.String),
+);
+
+export const DependencySections = Schema.Struct({
+  dependencies: DependencyMap,
+  devDependencies: DependencyMap,
+  peerDependencies: DependencyMap,
+  optionalDependencies: DependencyMap,
+});
+
+/**
+ * Order packages so every package comes after the packed packages it
+ * depends on, grouped into levels that can be packed concurrently. Fails on
+ * a cycle, since a tarball cannot link to a dependency that links back.
+ */
+export const dependencyLevels = Effect.fn("dependencyLevels")(function* (
+  dependencies: ReadonlyMap<string, ReadonlySet<string>>,
+) {
+  const remaining = new Map(
+    [...dependencies].map(([name, deps]) => [
+      name,
+      new Set([...deps].filter((dep) => dependencies.has(dep))),
+    ]),
+  );
+  const levels: string[][] = [];
+  while (remaining.size > 0) {
+    const ready = [...remaining]
+      .filter(([, deps]) => deps.size === 0)
+      .map(([name]) => name)
+      .sort();
+    if (ready.length === 0) {
+      return yield* new WorkspaceError({
+        message: `Dependency cycle among packed packages: ${[...remaining.keys()].sort().join(", ")}`,
+      });
+    }
+    for (const name of ready) remaining.delete(name);
+    for (const deps of remaining.values()) {
+      for (const name of ready) deps.delete(name);
+    }
+    levels.push(ready);
+  }
+  return levels;
+});
+
+export interface WorkspacePackage {
+  readonly name: string;
+  readonly version: string;
+  /** Relative to the workspace root, POSIX separators. */
+  readonly dir: string;
+  readonly absDir: string;
+  readonly group: string;
+}
+
+/**
+ * Expand one level of `{a,b,c}` alternatives into plain patterns, so
+ * `./packages/{alchemy,pkg}` lists exactly those two directories.
+ */
+export const expandBraces = (pattern: string): string[] => {
+  const match = pattern.match(/^(.*?)\{([^{}]*)\}(.*)$/);
+  if (!match) return [pattern];
+  return match[2]!
+    .split(",")
+    .map((alternative) => alternative.trim())
+    .filter((alternative) => alternative.length > 0)
+    .flatMap((alternative) =>
+      expandBraces(`${match[1]}${alternative}${match[3]}`),
+    );
+};
+
+/**
+ * Expand a directory glob. `*` is supported as a whole path segment and
+ * `{a,b}` as a list of alternatives, which covers `./packages/*` and
+ * `./submodules/x/packages/{core,aws}`. Matches are directories only.
+ */
+const expand = Effect.fn("expandGlob")(function* (cwd: string, glob: string) {
+  const results: string[] = [];
+  for (const pattern of expandBraces(glob)) {
+    results.push(...(yield* expandPattern(cwd, pattern)));
+  }
+  return [...new Set(results)];
+});
+
+const expandPattern = Effect.fn("expandPattern")(function* (
+  cwd: string,
+  pattern: string,
+) {
+  const fs = yield* FileSystem.FileSystem;
+  const path = yield* Path.Path;
+  if (pattern.includes("**")) {
+    return yield* new WorkspaceError({
+      message: `Unsupported pattern ${JSON.stringify(pattern)}: only a single "*" segment is supported`,
+    });
+  }
+  const segments = pattern.split("/").filter((s) => s !== "" && s !== ".");
+  let current: string[] = [cwd];
+  for (const segment of segments) {
+    const next: string[] = [];
+    for (const base of current) {
+      if (segment === "*") {
+        const entries = yield* fs.readDirectory(base);
+        for (const entry of entries.sort()) {
+          const candidate = path.join(base, entry);
+          const stat = yield* fs.stat(candidate);
+          if (stat.type === "Directory") next.push(candidate);
+        }
+      } else if (segment.includes("*")) {
+        return yield* new WorkspaceError({
+          message: `Unsupported pattern ${JSON.stringify(pattern)}: "*" must be a whole path segment`,
+        });
+      } else {
+        const candidate = path.join(base, segment);
+        if (yield* fs.exists(candidate)) next.push(candidate);
+      }
+    }
+    current = next;
+  }
+  return current;
+});
+
+/**
+ * Discover publishable packages under each group's pattern, in the order the
+ * groups and their directories were given, which is the order they are
+ * listed in. Private packages and directories without a named
+ * `package.json` are skipped. A package name appearing under two groups is
+ * an error.
+ */
+export const discover = Effect.fn("discoverPackages")(function* (
+  cwd: string,
+  groups: ReadonlyArray<Group>,
+) {
+  const fs = yield* FileSystem.FileSystem;
+  const path = yield* Path.Path;
+  const decode = Schema.decodeUnknownEffect(Schema.fromJsonString(PackageJson));
+  const found = new Map<string, WorkspacePackage>();
+  for (const group of groups) {
+    for (const absDir of yield* expand(cwd, group.pattern)) {
+      const manifestPath = path.join(absDir, "package.json");
+      if (!(yield* fs.exists(manifestPath))) continue;
+      const manifest = yield* decode(yield* fs.readFileString(manifestPath));
+      if (manifest.private || manifest.name === undefined) continue;
+      const existing = found.get(manifest.name);
+      if (existing !== undefined) {
+        return yield* new WorkspaceError({
+          message: `Package ${manifest.name} found in both ${existing.dir} and ${path.relative(cwd, absDir)}`,
+        });
+      }
+      found.set(manifest.name, {
+        name: manifest.name,
+        version: manifest.version ?? "0.0.0",
+        dir: path.relative(cwd, absDir).split(path.sep).join("/"),
+        absDir,
+        group: group.name,
+      });
+    }
+  }
+  return [...found.values()];
+});
+
+export class GitError extends Data.TaggedError("GitError")<{
+  readonly args: ReadonlyArray<string>;
+  readonly cwd: string;
+  readonly exitCode: number;
+  readonly stderr: string;
+}> {
+  override get message() {
+    return `git ${this.args.join(" ")} in ${this.cwd} exited with ${this.exitCode}: ${this.stderr.trim()}`;
+  }
+}
+
+/** Run `git` in `cwd` and return trimmed stdout. */
+export const git = Effect.fn("git")(function* (
+  cwd: string,
+  args: ReadonlyArray<string>,
+) {
+  const spawner = yield* ChildProcessSpawner;
+  const handle = yield* spawner.spawn(
+    ChildProcess.make("git", [...args], { cwd, shell: false }),
+  );
+  const [exitCode, stdout, stderr] = yield* Effect.all(
+    [
+      handle.exitCode,
+      Stream.mkString(Stream.decodeText(handle.stdout)),
+      Stream.mkString(Stream.decodeText(handle.stderr)),
+    ],
+    { concurrency: 3 },
+  );
+  if (exitCode !== 0) {
+    return yield* new GitError({ args, cwd, exitCode, stderr });
+  }
+  return stdout.trim();
+}, Effect.scoped);
+
+/** Absolute path of the repository (or submodule) that owns `cwd`. */
+export const toplevel = (cwd: string) =>
+  git(cwd, ["rev-parse", "--show-toplevel"]);
+
+/** Full HEAD SHA of the repository that owns `cwd`. */
+const gitHead = (cwd: string) => git(cwd, ["rev-parse", "HEAD"]);
+
+export class PackError extends Data.TaggedError("PackError")<{
+  readonly dir: string;
+  readonly message: string;
+}> {}
+
+const PnpmPackOutput = Schema.fromJsonString(
+  Schema.Struct({ filename: Schema.String }),
+);
+
+/**
+ * Immutable tarball URL on the registry. Dependencies between packed
+ * packages link to these, so a tarball's bytes depend only on its own
+ * source and its dependencies' bytes, never on a commit, and identical
+ * builds deduplicate across commits, pull requests, and repositories.
+ */
+export const tarballUrl = (registry: string, name: string, sha256: string) =>
+  `${registry.replace(/\/+$/, "")}/${name}/-/${sha256}.tgz`;
+
+/**
+ * Rewrite every dependency on a package in `links` to that package's
+ * tarball URL. Returns the rewritten manifest text and the rewrites made.
+ */
+export const rewriteDependencies = (
+  manifestText: string,
+  links: ReadonlyMap<string, string>,
+) =>
+  Effect.gen(function* () {
+    const manifest = yield* Schema.decodeUnknownEffect(
+      Schema.fromJsonString(
+        Schema.StructWithRest(DependencySections, [
+          Schema.Record(Schema.String, Schema.Unknown),
+        ]),
+      ),
+      // Key order contributes to the tarball hash, even for unrelated fields.
+      { propertyOrder: "original" },
+    )(manifestText);
+    const rewritten = { ...manifest };
+    const rewrites: Array<{ section: string; name: string; url: string }> = [];
+    for (const section of DEPENDENCY_SECTIONS) {
+      const deps = manifest[section];
+      if (deps === undefined) continue;
+      const next: Record<string, string> = { ...deps };
+      for (const name of Object.keys(deps)) {
+        const url = links.get(name);
+        if (url === undefined) continue;
+        next[name] = url;
+        rewrites.push({ section, name, url });
+      }
+      rewritten[section] = next;
+    }
+    return { text: `${JSON.stringify(rewritten, null, 2)}\n`, rewrites };
+  });
+
+const EPOCH = new Date(0);
+
+/**
+ * Normalize tar headers so identical inputs produce identical bytes:
+ * fixed mtime, no ownership, entries sorted by path.
+ */
+const normalize = (header: TarHeader, size: number): TarHeader => ({
+  name: header.name,
+  size,
+  mode: header.mode,
+  type: header.type ?? "file",
+  mtime: EPOCH,
+  uid: 0,
+  gid: 0,
+  uname: "",
+  gname: "",
+  ...(header.linkname !== undefined ? { linkname: header.linkname } : {}),
+});
+
+export interface PackedTarball {
+  readonly file: string;
+  readonly sha256: string;
+  readonly size: number;
+  readonly rewrites: ReadonlyArray<{
+    section: string;
+    name: string;
+    url: string;
+  }>;
+}
+
+/**
+ * Pack one package with pnpm, rewrite its dependencies on already-packed
+ * packages to their tarball URLs, and repack reproducibly into `outDir/file`.
+ */
+export const packPackage = Effect.fn("packPackage")(function* (options: {
+  readonly absDir: string;
+  /** Tarball URL of every already-packed dependency, by package name. */
+  readonly links: ReadonlyMap<string, string>;
+  readonly outDir: string;
+  readonly file: string;
+}) {
+  const fs = yield* FileSystem.FileSystem;
+  const path = yield* Path.Path;
+  const spawner = yield* ChildProcessSpawner;
+  const tmp = yield* fs.makeTempDirectoryScoped({ prefix: "pkg-pack-" });
+
+  const handle = yield* spawner.spawn(
+    ChildProcess.make("pnpm", ["pack", "--json", "--pack-destination", tmp], {
+      cwd: options.absDir,
+      shell: false,
+    }),
+  );
+  const [exitCode, stdout, stderr] = yield* Effect.all(
+    [
+      handle.exitCode,
+      Stream.mkString(Stream.decodeText(handle.stdout)),
+      Stream.mkString(Stream.decodeText(handle.stderr)),
+    ],
+    { concurrency: 3 },
+  );
+  if (exitCode !== 0) {
+    return yield* new PackError({
+      dir: options.absDir,
+      message: `pnpm pack exited with ${exitCode}: ${stderr.trim() || stdout.trim()}`,
+    });
+  }
+  // pnpm may print progress lines before the JSON document.
+  const json = stdout.slice(stdout.indexOf("{"));
+  const { filename } = yield* Schema.decodeUnknownEffect(PnpmPackOutput)(json);
+
+  const packed = yield* fs.readFile(path.join(tmp, path.basename(filename)));
+  const inflated = yield* Effect.sync(() => gunzipSync(packed));
+  const entries = yield* Effect.promise(() => unpackTar(inflated));
+
+  let rewrites: PackedTarball["rewrites"] = [];
+  const normalized: Array<{ header: TarHeader; data: Uint8Array }> = [];
+  for (const entry of entries.sort((a, b) =>
+    a.header.name.localeCompare(b.header.name),
+  )) {
+    let data = entry.data ?? new Uint8Array();
+    if (entry.header.name === "package/package.json") {
+      const result = yield* rewriteDependencies(
+        new TextDecoder().decode(data),
+        options.links,
+      ).pipe(
+        Effect.mapError(
+          (e) => new PackError({ dir: options.absDir, message: String(e) }),
+        ),
+      );
+      rewrites = result.rewrites;
+      data = new TextEncoder().encode(result.text);
+    }
+    normalized.push({ header: normalize(entry.header, data.byteLength), data });
+  }
+
+  const tar = yield* Effect.promise(() => packTar(normalized));
+  const bytes = yield* Effect.sync(() => gzipSync(tar, { level: 9 }));
+  const sha256 = yield* Effect.sync(() =>
+    createHash("sha256").update(bytes).digest("hex"),
+  );
+  yield* fs.writeFile(path.join(options.outDir, options.file), bytes);
+  return {
+    file: options.file,
+    sha256,
+    size: bytes.byteLength,
+    rewrites,
+  } satisfies PackedTarball;
+});
 
 const PullRequestEvent = Schema.fromJsonString(
   Schema.Struct({
@@ -66,8 +457,8 @@ export const pack = Effect.fn("pack")(function* (options: PackOptions) {
   const fs = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
 
-  const root = yield* Git.toplevel(options.cwd);
-  const head = yield* Git.head(root);
+  const root = yield* toplevel(options.cwd);
+  const head = yield* gitHead(root);
   const prHead = yield* pullRequestHead;
   if (prHead !== undefined && prHead !== head) {
     return yield* new WorkspaceError({

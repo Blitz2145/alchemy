@@ -17,7 +17,7 @@ import {
   TarballResponse,
   tarballPath,
 } from "../Api.ts";
-import { MANIFEST_FILE, ManifestJson, type Manifest } from "../Manifest.ts";
+import { MANIFEST_FILE, ManifestJson, type Manifest } from "../Api.ts";
 
 export class PublishError extends Data.TaggedError("PublishError")<{
   readonly message: string;
@@ -53,13 +53,16 @@ const bodyJson = (
     const text = yield* response.text.pipe(
       Effect.mapError((e) => new PublishError({ message: `${what}: ${e}` })),
     );
-    return yield* Effect.try({
-      try: () => JSON.parse(text) as unknown,
-      catch: () =>
-        new PublishError({
-          message: `${what}: ${response.status} ${text.slice(0, 500)}`,
-        }),
-    });
+    return yield* Schema.decodeUnknownEffect(
+      Schema.fromJsonString(Schema.Unknown),
+    )(text).pipe(
+      Effect.mapError(
+        () =>
+          new PublishError({
+            message: `${what}: ${response.status} ${text.slice(0, 500)}`,
+          }),
+      ),
+    );
   });
 
 const decodeResponse = <S extends Schema.Top>(
@@ -129,8 +132,8 @@ export const publish = Effect.fn("publish")(function* (
     | { readonly missing: MissingResponse["missing"] }
     | { readonly published: PublishResponse };
 
-  const attempt: Effect.Effect<Outcome, PublishError, HttpClient.HttpClient> =
-    Effect.gen(function* () {
+  const attempt: Effect.Effect<Outcome, PublishError> = Effect.gen(
+    function* () {
       const response = yield* send(
         HttpClientRequest.post(`${registry}/api/publish`).pipe(
           HttpClientRequest.bodyJsonUnsafe(
@@ -148,7 +151,8 @@ export const publish = Effect.fn("publish")(function* (
       return {
         published: yield* decodeResponse("publish", response, PublishResponse),
       } satisfies Outcome;
-    });
+    },
+  );
 
   const upload = (pkg: Manifest["packages"][number]) =>
     Effect.gen(function* () {
@@ -186,7 +190,7 @@ export const publish = Effect.fn("publish")(function* (
         wanted.has(`${pkg.name}@${pkg.sha256}`),
       ),
       upload,
-      { concurrency: 4 },
+      { concurrency: 4, discard: true },
     );
     outcome = yield* attempt;
     if ("missing" in outcome) {

@@ -1,5 +1,6 @@
 import * as Cloudflare from "alchemy/Cloudflare";
 import * as SQL from "alchemy/SQL/D1";
+import * as Clock from "effect/Clock";
 import * as Config from "effect/Config";
 import * as Data from "effect/Data";
 import * as Duration from "effect/Duration";
@@ -23,8 +24,8 @@ import {
   RUN_HEADER,
   TarballResponse,
 } from "../Api.ts";
-import { ManifestJson, type ManifestPackage } from "../Manifest.ts";
-import type { Policy } from "../Policy.ts";
+import { ManifestJson, type ManifestPackage } from "../Api.ts";
+import type { Policy } from "../Api.ts";
 import {
   APP_ID_ENV,
   COMMENT_MARKER,
@@ -32,11 +33,29 @@ import {
   PRIVATE_KEY_ENV,
   SWEEP_LOOKAHEAD_MS,
   type RegistryConfig,
-} from "./Config.ts";
-import { importPrivateKey, sha256Hex } from "./Crypto.ts";
+} from "../Api.ts";
+import { importPrivateKey, sha256Hex } from "./GitHub.ts";
 import * as Db from "./Db.ts";
 import * as GitHub from "./GitHub.ts";
-import { Index, Tarballs, tarballKey } from "./Resources.ts";
+
+/** Content-addressed tarballs, keyed `<encoded name>/<sha256>.tgz`. */
+export const Tarballs = Cloudflare.R2.Bucket("PkgTarballs");
+
+// The migrations ship inside this package. `import.meta.url` is a file URL
+// during plan/deploy and absent or opaque inside the isolate, where the
+// resource declaration is only evaluated for its binding.
+const migrationsDir =
+  typeof import.meta.url === "string" && import.meta.url.startsWith("file:")
+    ? decodeURIComponent(new URL("../../migrations", import.meta.url).pathname)
+    : undefined;
+
+/** Publications, tags, and tarball bookkeeping. */
+export const Index = Cloudflare.D1.Database("PkgIndex", {
+  migrations: migrationsDir,
+});
+
+export const tarballKey = (name: string, sha256: string) =>
+  `${encodeURIComponent(name)}/${sha256}.tgz`;
 
 /** A failure that maps directly to an HTTP response. */
 export class HttpError extends Data.TaggedError("HttpError")<{
@@ -110,10 +129,6 @@ const parseInstallPath = (
 const qualify = (name: string, scope: string | undefined) =>
   scope !== undefined && !name.startsWith("@") ? `${scope}/${name}` : name;
 
-// Package names are already URL-safe apart from `@` and `/`, both of which
-// npm clients and the router expect verbatim, so URLs use the name as is.
-const encodeName = (name: string) => name;
-
 /**
  * Tags every package in a publication receives, all derived from the run:
  * its head commit, the short commit, `pr:N` for pull requests, and
@@ -131,75 +146,6 @@ const tagsFor = (run: Run): string[] => {
   }
   return tags;
 };
-
-/** Install commands per package, grouped, pinned to the run's short commit. */
-const renderInstalls = (
-  origin: string,
-  run: Run,
-  packages: ReadonlyArray<{ name: string; group: string }>,
-) => {
-  const groups = new Map<string, string[]>();
-  for (const pkg of packages) {
-    groups.set(pkg.group, [...(groups.get(pkg.group) ?? []), pkg.name]);
-  }
-  const short = run.headSha.slice(0, SHORT);
-  // Packages appear in the order the manifest lists them, which is the
-  // order they were given to `pkg pack`.
-  return [...groups]
-    .flatMap(([group, names]) => [
-      `### ${group}`,
-      "",
-      ...names.flatMap((name) => [
-        `**${name}**`,
-        "```sh",
-        `pnpm install ${origin}/${encodeName(name)}/${short}`,
-        "```",
-        "",
-      ]),
-    ])
-    .join("\n");
-};
-
-/**
- * GitHub's `<relative-time>` element, rendered as a live relative time in
- * comments, with a plain UTC fallback like `Sep 7, 2026 2:42pm UTC`.
- */
-const relativeTime = (millis: number) => {
-  const date = new Date(millis);
-  const months = [
-    "Jan",
-    "Feb",
-    "Mar",
-    "Apr",
-    "May",
-    "Jun",
-    "Jul",
-    "Aug",
-    "Sep",
-    "Oct",
-    "Nov",
-    "Dec",
-  ];
-  const hours = date.getUTCHours();
-  const clock = `${hours % 12 || 12}:${String(date.getUTCMinutes()).padStart(2, "0")}${hours < 12 ? "am" : "pm"}`;
-  const label = `${months[date.getUTCMonth()]} ${date.getUTCDate()}, ${date.getUTCFullYear()} ${clock} UTC`;
-  return `<relative-time datetime="${date.toISOString()}">${label}</relative-time>`;
-};
-
-const renderComment = (
-  origin: string,
-  run: Run,
-  packages: ReadonlyArray<{ name: string; group: string }>,
-  times: { readonly publishedAt: number; readonly expiresAt: number },
-) =>
-  [
-    COMMENT_MARKER,
-    "",
-    "Install the packages built from this commit:",
-    "",
-    renderInstalls(origin, run, packages),
-    `Published ${relativeTime(times.publishedAt)}. Expires ${relativeTime(times.expiresAt)}, extended while this pull request is open.`,
-  ].join("\n");
 
 const CHECK_NAME = "Preview packages";
 
@@ -267,7 +213,10 @@ export const make = (config: RegistryConfig) =>
       Effect.gen(function* () {
         const key = `${ref.repo}#${ref.runId}:${ref.attempt}`;
         const cached = runs.get(key);
-        if (cached !== undefined && Date.now() - cached.at < RUN_CACHE_MS) {
+        if (
+          cached !== undefined &&
+          (yield* Clock.currentTimeMillis) - cached.at < RUN_CACHE_MS
+        ) {
           return cached.run;
         }
         const gh = yield* github;
@@ -313,7 +262,7 @@ export const make = (config: RegistryConfig) =>
             data.head_repository?.full_name ?? data.repository.full_name,
           pr,
         };
-        runs.set(key, { run, at: Date.now() });
+        runs.set(key, { run, at: yield* Clock.currentTimeMillis });
         return run;
       });
 
@@ -366,16 +315,20 @@ export const make = (config: RegistryConfig) =>
           ),
         );
         const packages = manifest.packages;
-        yield* Effect.forEach(packages, validatePackage);
+        yield* Effect.forEach(packages, validatePackage, { discard: true });
 
-        const present = yield* Effect.forEach(
+        const missing = yield* Effect.filter(
           packages,
-          (pkg) => r2.head(tarballKey(pkg.name, pkg.sha256)),
+          (pkg) =>
+            r2
+              .head(tarballKey(pkg.name, pkg.sha256))
+              .pipe(Effect.map((object) => object === null)),
           { concurrency: 8 },
+        ).pipe(
+          Effect.map((packages) =>
+            packages.map(({ name, sha256 }) => ({ name, sha256 })),
+          ),
         );
-        const missing = packages
-          .filter((_, index) => present[index] === null)
-          .map((pkg) => ({ name: pkg.name, sha256: pkg.sha256 }));
         if (missing.length > 0) {
           return yield* HttpServerResponse.json(
             { missing } satisfies MissingResponse,
@@ -383,28 +336,33 @@ export const make = (config: RegistryConfig) =>
           );
         }
 
-        const now = Date.now();
+        const now = yield* Clock.currentTimeMillis;
         const expiresAt = now + ttlMillis(policy);
         const prs = run.pr !== null ? [`${run.repo}#${run.pr}`] : [];
-        const published: PublishResponse["packages"][number][] = [];
         const tags = tagsFor(run);
-        for (const pkg of packages) {
-          for (const tag of tags) {
-            yield* Db.upsertTag(sql, {
-              package: pkg.name,
-              tag,
-              sha256: pkg.sha256,
-              expiresAt,
-              prs,
-            });
-          }
-          published.push({
-            name: pkg.name,
-            group: pkg.group,
-            url: `${origin}/${encodeName(pkg.name)}/${run.headSha.slice(0, SHORT)}`,
-            tags,
-          });
-        }
+        const published = yield* Effect.forEach(
+          packages,
+          Effect.fn(function* (pkg) {
+            yield* Effect.forEach(
+              tags,
+              (tag) =>
+                Db.upsertTag(sql, {
+                  package: pkg.name,
+                  tag,
+                  sha256: pkg.sha256,
+                  expiresAt,
+                  prs,
+                }),
+              { discard: true },
+            );
+            return {
+              name: pkg.name,
+              group: pkg.group,
+              url: `${origin}/${pkg.name}/${run.headSha.slice(0, SHORT)}`,
+              tags,
+            };
+          }),
+        );
 
         const gh = yield* github;
         // A check on the commit itself, so the install lines are visible on
@@ -413,7 +371,7 @@ export const make = (config: RegistryConfig) =>
           headSha: run.headSha,
           name: CHECK_NAME,
           title: `${packages.length} package(s) published`,
-          summary: renderInstalls(origin, run, packages),
+          summary: GitHub.renderInstalls(origin, run, packages),
           detailsUrl: origin,
         }).pipe(
           Effect.catch((e) =>
@@ -423,7 +381,7 @@ export const make = (config: RegistryConfig) =>
           ),
         );
         if (run.pr !== null) {
-          const body = renderComment(origin, run, packages, {
+          const body = GitHub.renderComment(origin, run, packages, {
             publishedAt: now,
             expiresAt,
           });
@@ -510,7 +468,7 @@ export const make = (config: RegistryConfig) =>
      * points at are deleted from R2.
      */
     const sweep = Effect.gen(function* () {
-      const now = Date.now();
+      const now = yield* Clock.currentTimeMillis;
       const ttl = ttlMillis(policy);
       const due = yield* Db.dueLinkedTags(sql, now + SWEEP_LOOKAHEAD_MS);
       if (due.length > 0) {
@@ -651,10 +609,10 @@ export const make = (config: RegistryConfig) =>
             message: `${target.name}@${target.tag} not found`,
           });
         }
-        return HttpServerResponse.redirect(
-          `/${encodeName(target.name)}/-/${sha256}.tgz`,
-          { status: 302, headers: { "cache-control": "no-store" } },
-        );
+        return HttpServerResponse.redirect(`/${target.name}/-/${sha256}.tgz`, {
+          status: 302,
+          headers: { "cache-control": "no-store" },
+        });
       }
       const object = yield* r2.get(tarballKey(target.name, target.sha256));
       if (object === null) {
