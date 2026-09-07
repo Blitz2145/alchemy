@@ -109,11 +109,12 @@ const encodeName = (name: string) =>
   name.split("/").map(encodeURIComponent).join("/");
 
 /**
- * Tags a package receives: its commit, the short commit, `pr:N` for pull
- * requests, and `branch:<name>` for pushes and same-repo pull requests.
+ * Tags every package in a publication receives, all derived from the run:
+ * its head commit, the short commit, `pr:N` for pull requests, and
+ * `branch:<name>` for pushes and same-repo pull requests.
  */
-const tagsFor = (pkg: ManifestPackage, run: Run): string[] => {
-  const tags = [pkg.commit, pkg.commit.slice(0, SHORT)];
+const tagsFor = (run: Run): string[] => {
+  const tags = [run.headSha, run.headSha.slice(0, SHORT)];
   if (run.pr !== null) {
     tags.push(`pr:${run.pr}`);
     if (run.headRepo === run.repo && run.headBranch) {
@@ -125,23 +126,22 @@ const tagsFor = (pkg: ManifestPackage, run: Run): string[] => {
   return tags;
 };
 
-/** Grouped `bun add` lines pinned to each package's short commit. */
+/** Grouped `bun add` lines pinned to the run's short commit. */
 const renderInstalls = (
   origin: string,
-  packages: ReadonlyArray<{ name: string; group: string; commit: string }>,
+  run: Run,
+  packages: ReadonlyArray<{ name: string; group: string }>,
 ) => {
-  const groups = new Map<string, Array<{ name: string; commit: string }>>();
+  const groups = new Map<string, string[]>();
   for (const pkg of packages) {
-    groups.set(pkg.group, [...(groups.get(pkg.group) ?? []), pkg]);
+    groups.set(pkg.group, [...(groups.get(pkg.group) ?? []), pkg.name]);
   }
+  const short = run.headSha.slice(0, SHORT);
   return [...groups]
-    .flatMap(([group, pkgs]) => [
+    .flatMap(([group, names]) => [
       `### ${group}`,
       "```sh",
-      ...pkgs.map(
-        (pkg) =>
-          `bun add ${origin}/${encodeName(pkg.name)}@${pkg.commit.slice(0, SHORT)}`,
-      ),
+      ...names.map((name) => `bun add ${origin}/${encodeName(name)}@${short}`),
       "```",
       "",
     ])
@@ -151,13 +151,13 @@ const renderInstalls = (
 const renderComment = (
   origin: string,
   run: Run,
-  packages: ReadonlyArray<{ name: string; group: string; commit: string }>,
+  packages: ReadonlyArray<{ name: string; group: string }>,
 ) =>
   [
     COMMENT_MARKER,
     `Preview packages for ${run.headSha.slice(0, SHORT)}:`,
     "",
-    renderInstalls(origin, packages),
+    renderInstalls(origin, run, packages),
   ].join("\n");
 
 const CHECK_NAME = "Preview packages";
@@ -343,8 +343,8 @@ export const make = (config: RegistryConfig) =>
         const expiresAt = now + ttlMillis(policy);
         const prs = run.pr !== null ? [`${run.repo}#${run.pr}`] : [];
         const published: PublishResponse["packages"][number][] = [];
+        const tags = tagsFor(run);
         for (const pkg of packages) {
-          const tags = tagsFor(pkg, run);
           for (const tag of tags) {
             yield* Db.upsertTag(sql, {
               package: pkg.name,
@@ -357,7 +357,7 @@ export const make = (config: RegistryConfig) =>
           published.push({
             name: pkg.name,
             group: pkg.group,
-            url: `${origin}/${encodeName(pkg.name)}@${pkg.commit.slice(0, SHORT)}`,
+            url: `${origin}/${encodeName(pkg.name)}@${run.headSha.slice(0, SHORT)}`,
             tags,
           });
         }
@@ -369,7 +369,7 @@ export const make = (config: RegistryConfig) =>
           headSha: run.headSha,
           name: CHECK_NAME,
           title: `${packages.length} package(s) published`,
-          summary: renderInstalls(origin, packages),
+          summary: renderInstalls(origin, run, packages),
           detailsUrl: origin,
         }).pipe(
           Effect.catch((e) =>

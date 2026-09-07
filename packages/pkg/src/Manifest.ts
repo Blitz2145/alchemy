@@ -3,10 +3,9 @@ import * as Schema from "effect/Schema";
 /**
  * One packed workspace package inside a `pkg pack` artifact.
  *
- * Everything here is data the CLI observed while packing. The registry treats
- * it as a claim: package names are checked against policy, commits are
- * verified against the GitHub Actions run that produced the artifact, and the
- * tarball bytes are re-hashed on upload.
+ * Everything here is data the CLI observed while packing. The registry never
+ * derives a tag from it: every tag comes from the GitHub Actions run that
+ * vouched for the manifest, and tarball bytes are re-hashed on upload.
  */
 export const ManifestPackage = Schema.Struct({
   /** npm package name, scoped or unscoped. */
@@ -17,12 +16,6 @@ export const ManifestPackage = Schema.Struct({
   dir: Schema.String,
   /** Display group for the install comment, e.g. `Alchemy` or `Distilled`. */
   group: Schema.String,
-  /**
-   * Full commit SHA of the git repository that owns the package directory.
-   * For a package inside a submodule this is the submodule's HEAD, not the
-   * root repository's.
-   */
-  commit: Schema.String,
   /** Tarball file name inside the artifact directory. */
   file: Schema.String,
   /** Lowercase hex SHA-256 of the tarball bytes. */
@@ -40,7 +33,12 @@ export const Manifest = Schema.Struct({
   version: Schema.Literal(1),
   /** Registry origin the tarball dependencies were rewritten against. */
   registry: Schema.String,
-  /** HEAD commit of the root repository at pack time. */
+  /**
+   * HEAD commit of the root repository at pack time. Dependency URLs inside
+   * the tarballs point at this commit for every packed package, including
+   * packages inside submodules, because the registry tags everything a run
+   * publishes with that run's head commit.
+   */
   head: Schema.String,
   packages: Schema.Array(ManifestPackage),
 });

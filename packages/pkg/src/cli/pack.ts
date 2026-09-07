@@ -51,8 +51,7 @@ const tarballFile = (name: string) =>
 
 /**
  * Pack every discovered package into `out` with a manifest describing each
- * tarball's owning commit. Nothing here talks to the registry: the output
- * directory is uploaded as a CI artifact and published by `pkg publish`.
+ * tarball. Nothing here talks to the registry.
  */
 export const pack = Effect.fn("pack")(function* (options: PackOptions) {
   const fs = yield* FileSystem.FileSystem;
@@ -74,30 +73,17 @@ export const pack = Effect.fn("pack")(function* (options: PackOptions) {
     return undefined;
   }
 
-  // Each package is tagged by the commit of the repository that owns it, so a
-  // package inside a submodule is addressed by the submodule's HEAD.
-  const commits = new Map<string, string>();
-  const owned = yield* Effect.forEach(
-    packages,
-    Effect.fn(function* (pkg) {
-      const top = yield* Git.toplevel(pkg.absDir);
-      let commit = commits.get(top);
-      if (commit === undefined) {
-        commit = yield* Git.head(top);
-        commits.set(top, commit);
-      }
-      return { ...pkg, commit };
-    }),
-    { concurrency: 8 },
-  );
-  const published = new Map(owned.map((pkg) => [pkg.name, pkg.commit]));
+  // The registry tags everything a run publishes with the run's head commit,
+  // packages inside submodules included, so every rewritten dependency points
+  // at the root repository's HEAD.
+  const published = new Map(packages.map((pkg) => [pkg.name, head]));
 
   const outDir = path.resolve(options.cwd, options.out);
   yield* fs.remove(outDir, { recursive: true, force: true });
   yield* fs.makeDirectory(outDir, { recursive: true });
 
   const entries = yield* Effect.forEach(
-    owned,
+    packages,
     Effect.fn(function* (pkg) {
       const packed = yield* packPackage({
         absDir: pkg.absDir,
@@ -107,7 +93,7 @@ export const pack = Effect.fn("pack")(function* (options: PackOptions) {
         file: tarballFile(pkg.name),
       }).pipe(Effect.scoped);
       const lines = [
-        `${pkg.name}@${pkg.version} ${pkg.commit.slice(0, 7)} ${packed.sha256.slice(0, 12)} ${packed.size} bytes`,
+        `${pkg.name}@${pkg.version} ${packed.sha256.slice(0, 12)} ${packed.size} bytes`,
         ...packed.rewrites.map((r) => `  ${r.section}.${r.name} -> ${r.url}`),
       ];
       yield* Console.log(lines.join("\n"));
@@ -116,7 +102,6 @@ export const pack = Effect.fn("pack")(function* (options: PackOptions) {
         version: pkg.version,
         dir: pkg.dir,
         group: pkg.group,
-        commit: pkg.commit,
         file: packed.file,
         sha256: packed.sha256,
         size: packed.size,

@@ -27,10 +27,9 @@ pkg pack \
 
 For each non-private package under a group's glob, `pack`:
 
-- resolves the git repository that owns the directory, so a package inside a submodule is addressed by the submodule's HEAD, not the root repository's;
-- runs `pnpm pack`, then rewrites every dependency on another packed package to `https://<registry>/<name>@<owning commit>`;
+- runs `pnpm pack`, then rewrites every dependency on another packed package to `https://<registry>/<name>@<HEAD of the root repository>`, since the registry tags everything a run publishes with that run's commit;
 - repacks with fixed timestamps and no ownership so identical inputs hash identically, letting the registry skip uploads it already has;
-- writes `pkg-manifest.json` describing each tarball's name, group, owning commit, SHA-256, and size.
+- writes `pkg-manifest.json` describing each tarball's name, group, SHA-256, and size.
 
 Globs support `*` as a whole path segment and `{a,b}` alternatives, so `./submodules/distilled/packages/{core,aws}` lists exactly those two. Repeat `--group` with the same name to add more directories to one group.
 
@@ -46,7 +45,7 @@ The Worker is configured with plain data, validated by the `Policy` schema expor
 }
 ```
 
-`repos` lists the repositories allowed to publish. A publication may contain any package; every package gets the commit, short commit, `branch:<name>`, and `pr:<number>` tags of the run that produced it. A package packed from a submodule is tagged by the submodule's commit, which is what the rewritten dependency URLs in the other tarballs point at.
+`repos` lists the repositories allowed to publish. A publication may contain any package; every package gets the commit, short commit, `branch:<name>`, and `pr:<number>` tags of the run that produced it, and nothing in the manifest can name a different commit. A package built from a submodule is therefore tagged with the publishing repository's commit, which is what the rewritten dependency URLs in the other tarballs point at.
 
 ## Cleanup
 
