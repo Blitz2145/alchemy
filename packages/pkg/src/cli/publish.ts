@@ -1,3 +1,4 @@
+import { DefaultArtifactClient } from "@actions/artifact";
 import * as Console from "effect/Console";
 import * as Data from "effect/Data";
 import * as Effect from "effect/Effect";
@@ -7,8 +8,10 @@ import * as Schema from "effect/Schema";
 import * as HttpClient from "effect/unstable/http/HttpClient";
 import * as HttpClientRequest from "effect/unstable/http/HttpClientRequest";
 import type * as HttpClientResponse from "effect/unstable/http/HttpClientResponse";
+import { createHash } from "node:crypto";
 import {
   ErrorResponse,
+  manifestArtifactName,
   MissingResponse,
   PublishRequest,
   PublishResponse,
@@ -17,7 +20,7 @@ import {
   TarballResponse,
   tarballPath,
 } from "../Api.ts";
-import type { Manifest } from "../Manifest.ts";
+import { MANIFEST_FILE, type Manifest } from "../Manifest.ts";
 import { pack, type PackOptions } from "./pack.ts";
 
 export class PublishError extends Data.TaggedError("PublishError")<{
@@ -25,8 +28,6 @@ export class PublishError extends Data.TaggedError("PublishError")<{
 }> {}
 
 export type PublishOptions = PackOptions;
-
-const IdToken = Schema.Struct({ value: Schema.String });
 
 /**
  * The GitHub Actions run this job belongs to, from the runner's environment.
@@ -44,33 +45,28 @@ const currentRun = Effect.gen(function* () {
 });
 
 /**
- * Mint a GitHub Actions OIDC token for the registry, or `undefined` when the
- * runner offers none. GitHub grants no token to pull requests from forks;
- * those jobs are verified by the registry through the GitHub API instead.
+ * Vouch for the manifest by uploading it as an artifact of this run. Only
+ * this job holds the runtime token that can do that, and the registry reads
+ * the artifact list back through the GitHub API, so the artifact is the
+ * proof that this run, and not someone merely naming it, submitted these
+ * package hashes.
  */
-const idToken = (audience: string) =>
-  Effect.gen(function* () {
-    const requestUrl = process.env.ACTIONS_ID_TOKEN_REQUEST_URL;
-    const requestToken = process.env.ACTIONS_ID_TOKEN_REQUEST_TOKEN;
-    if (!requestUrl || !requestToken) return undefined;
-    const http = yield* HttpClient.HttpClient;
-    return yield* http
-      .execute(
-        HttpClientRequest.get(requestUrl).pipe(
-          HttpClientRequest.appendUrlParam("audience", audience),
-          HttpClientRequest.bearerToken(requestToken),
-        ),
-      )
-      .pipe(
-        Effect.flatMap((r) => r.json),
-        Effect.flatMap(Schema.decodeUnknownEffect(IdToken)),
-        Effect.map((r): string | undefined => r.value),
-        Effect.catch((e) =>
-          Console.warn(
-            `OIDC token unavailable, falling back to run verification: ${e}`,
-          ).pipe(Effect.as(undefined)),
-        ),
+const vouch = (manifestPath: string, dir: string, sha256: string) =>
+  Effect.tryPromise({
+    try: async () => {
+      const client = new DefaultArtifactClient();
+      const result = await client.uploadArtifact(
+        manifestArtifactName(sha256),
+        [manifestPath],
+        dir,
+        { retentionDays: 1 },
       );
+      return result.id;
+    },
+    catch: (cause) =>
+      new PublishError({
+        message: `could not upload the manifest artifact to this run: ${cause}`,
+      }),
   });
 
 const bodyJson = (
@@ -113,9 +109,9 @@ const decodeResponse = <S extends Schema.Top>(
 
 /**
  * Pack the workspace and publish it from the current GitHub Actions job.
- * Every request names the run; same-repo jobs also carry an OIDC token. The
- * registry verifies the run and either reports the tarballs it lacks, which
- * are uploaded before trying again, or writes the tags.
+ * The manifest is uploaded as an artifact of the run first; the registry
+ * verifies that artifact through GitHub, then either reports the tarballs it
+ * lacks, which are uploaded before trying again, or writes the tags.
  */
 export const publish = Effect.fn("publish")(function* (
   options: PublishOptions,
@@ -129,28 +125,32 @@ export const publish = Effect.fn("publish")(function* (
   const manifest = yield* pack(options);
   if (manifest === undefined) return undefined;
   const dir = path.resolve(options.cwd, options.out);
+  const manifestPath = path.join(dir, MANIFEST_FILE);
+  const manifestText = yield* fs.readFileString(manifestPath);
+  const manifestSha = yield* Effect.sync(() =>
+    createHash("sha256").update(manifestText).digest("hex"),
+  );
+
+  yield* vouch(manifestPath, dir, manifestSha);
+  yield* Console.log(
+    `Vouched for the manifest as artifact ${manifestArtifactName(manifestSha)}`,
+  );
 
   const send = (request: HttpClientRequest.HttpClientRequest) =>
-    Effect.gen(function* () {
-      const token = yield* idToken(registry);
-      const named = request.pipe(
-        HttpClientRequest.setHeader(
-          RUN_HEADER,
-          runHeader(run.repo, run.runId, run.attempt),
+    http
+      .execute(
+        request.pipe(
+          HttpClientRequest.setHeader(
+            RUN_HEADER,
+            runHeader(run.repo, run.runId, run.attempt),
+          ),
+        ),
+      )
+      .pipe(
+        Effect.mapError(
+          (e) => new PublishError({ message: `request failed: ${e}` }),
         ),
       );
-      return yield* http
-        .execute(
-          token === undefined
-            ? named
-            : named.pipe(HttpClientRequest.bearerToken(token)),
-        )
-        .pipe(
-          Effect.mapError(
-            (e) => new PublishError({ message: `request failed: ${e}` }),
-          ),
-        );
-    });
 
   type Outcome =
     | { readonly missing: MissingResponse["missing"] }
@@ -161,7 +161,7 @@ export const publish = Effect.fn("publish")(function* (
       const response = yield* send(
         HttpClientRequest.post(`${registry}/api/publish`).pipe(
           HttpClientRequest.bodyJsonUnsafe(
-            Schema.encodeUnknownSync(PublishRequest)({ manifest }),
+            Schema.encodeSync(PublishRequest)({ manifest: manifestText }),
           ),
         ),
       );

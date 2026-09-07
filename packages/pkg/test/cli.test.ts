@@ -2,8 +2,8 @@ import { describe, expect, test } from "bun:test";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 import * as Duration from "effect/Duration";
-import { parseRunHeader, runHeader } from "../src/Api.ts";
-import { Policy, publishWorkflowRef } from "../src/Policy.ts";
+import { manifestArtifactName, parseRunHeader, runHeader } from "../src/Api.ts";
+import { Policy } from "../src/Policy.ts";
 import { installUrl, rewriteDependencies } from "../src/cli/tarball.ts";
 import { expandBraces, parseGroup } from "../src/cli/workspace.ts";
 
@@ -13,14 +13,8 @@ describe("Policy", () => {
     ttl: Duration.weeks(1),
   });
 
-  test("ttl decodes to a Duration and workflow ref defaults", () => {
+  test("ttl decodes to a Duration", () => {
     expect(Duration.toMillis(policy.ttl!)).toBe(7 * 24 * 60 * 60 * 1000);
-    expect(publishWorkflowRef(policy, "alchemy-run/alchemy")).toBe(
-      "alchemy-run/alchemy/.github/workflows/pkg.yml@",
-    );
-    expect(
-      publishWorkflowRef({ ...policy, workflow: "publish.yml" }, "a/b"),
-    ).toBe("a/b/.github/workflows/publish.yml@");
   });
 });
 
@@ -103,5 +97,11 @@ describe("Api", () => {
     });
     expect(parseRunHeader("nope")).toBeUndefined();
     expect(parseRunHeader("alchemy-run/alchemy#x:1")).toBeUndefined();
+  });
+
+  test("manifest artifact name carries the manifest hash", () => {
+    expect(manifestArtifactName("ab".repeat(32))).toBe(
+      `pkg-manifest-${"ab".repeat(32)}`,
+    );
   });
 });

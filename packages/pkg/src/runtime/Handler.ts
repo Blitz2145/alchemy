@@ -14,6 +14,7 @@ import * as HttpClient from "effect/unstable/http/HttpClient";
 import { HttpServerRequest } from "effect/unstable/http/HttpServerRequest";
 import * as HttpServerResponse from "effect/unstable/http/HttpServerResponse";
 import {
+  manifestArtifactName,
   MissingResponse,
   parseRunHeader,
   PublishRequest,
@@ -21,17 +22,15 @@ import {
   RUN_HEADER,
   TarballResponse,
 } from "../Api.ts";
-import type { ManifestPackage } from "../Manifest.ts";
-import { publishWorkflowRef, type Policy } from "../Policy.ts";
+import { ManifestJson, type ManifestPackage } from "../Manifest.ts";
+import type { Policy } from "../Policy.ts";
 import {
   COMMENT_MARKER,
-  OIDC_ISSUER,
-  OIDC_JWKS_URL,
   ORPHAN_GRACE_MS,
   SWEEP_LOOKAHEAD_MS,
   type RegistryConfig,
 } from "./Config.ts";
-import { importPrivateKey, Jwks, verifyJwt, type Jwk } from "./Crypto.ts";
+import { importPrivateKey, sha256Hex } from "./Crypto.ts";
 import * as Db from "./Db.ts";
 import * as GitHub from "./GitHub.ts";
 import { Index, Tarballs, tarballKey } from "./Resources.ts";
@@ -42,34 +41,15 @@ export class HttpError extends Data.TaggedError("HttpError")<{
   readonly message: string;
 }> {}
 
-const OidcClaims = Schema.fromJsonString(
-  Schema.Struct({
-    iss: Schema.String,
-    aud: Schema.Union([Schema.String, Schema.Array(Schema.String)]),
-    exp: Schema.Number,
-    nbf: Schema.optionalKey(Schema.Number),
-    repository: Schema.String,
-    job_workflow_ref: Schema.String,
-    run_id: Schema.String,
-  }),
-);
-
-/**
- * Who is publishing. `oidc` means the job presented a verified OIDC token
- * for this run. `run` means it only named the run, which the registry then
- * verifies through the GitHub API and accepts solely for fork pull requests,
- * since GitHub issues those jobs no token.
- */
-interface Identity {
+/** The run a request says it comes from. A hint until GitHub confirms it. */
+interface RunRef {
   readonly repo: string;
   readonly runId: number;
   readonly attempt: number;
-  readonly proof: "oidc" | "run";
 }
 
-/** What the registry learned about a build run from GitHub. */
-interface Run {
-  readonly repo: string;
+/** What GitHub says about a run. */
+interface Run extends RunRef {
   readonly headSha: string;
   readonly headBranch: string | null;
   readonly headRepo: string;
@@ -84,6 +64,9 @@ const bindings = Layer.mergeAll(
 );
 
 const SHORT = 7;
+
+/** How long a resolved run is reused for uploads before asking GitHub again. */
+const RUN_CACHE_MS = 60_000;
 
 const ttlMillis = (policy: Policy) =>
   Duration.toMillis(policy.ttl ?? Duration.weeks(1));
@@ -189,9 +172,9 @@ export const make = (config: RegistryConfig) =>
     const maxSize = policy.maxPackageSize;
 
     // Isolate-scoped caches of plain values: the imported App key and the
-    // OIDC signing keys. Neither is I/O-backed, so both survive requests.
+    // runs recently confirmed in progress. Neither is I/O-backed.
     let appKey: CryptoKey | undefined;
-    let jwks: { keys: ReadonlyArray<Jwk>; fetchedAt: number } | undefined;
+    const runs = new Map<string, { run: Run; at: number }>();
 
     const github = Effect.gen(function* () {
       if (appKey === undefined) {
@@ -211,165 +194,106 @@ export const make = (config: RegistryConfig) =>
       readonly message?: string;
     }) => new HttpError({ status: 502, message: GitHub.describe(e) });
 
-    const signingKeys = (kid: string | undefined) =>
+    /** The run a request names. Only allowed repositories are looked up at all. */
+    const runRef = (request: HttpServerRequest) =>
       Effect.gen(function* () {
-        const stale =
-          jwks === undefined ||
-          Date.now() - jwks.fetchedAt > 60 * 60 * 1000 ||
-          (kid !== undefined && !jwks.keys.some((k) => k.kid === kid));
-        if (stale) {
-          const response = yield* http.get(OIDC_JWKS_URL);
-          const body = yield* response.json;
-          const decoded = yield* Schema.decodeUnknownEffect(Jwks)(body);
-          jwks = { keys: decoded.keys, fetchedAt: Date.now() };
-        }
-        return jwks!.keys;
-      });
-
-    const authenticate = (request: HttpServerRequest, origin: string) =>
-      Effect.gen(function* () {
-        const run = parseRunHeader(request.headers[RUN_HEADER] ?? "");
-        if (run === undefined) {
+        const ref = parseRunHeader(request.headers[RUN_HEADER] ?? "");
+        if (ref === undefined) {
           return yield* new HttpError({
-            status: 401,
+            status: 400,
             message: `${RUN_HEADER} header is required`,
           });
         }
-        if (!policy.repos.includes(run.repo)) {
+        if (!policy.repos.includes(ref.repo)) {
           return yield* new HttpError({
             status: 403,
-            message: `${run.repo} may not publish`,
+            message: `${ref.repo} may not publish`,
           });
         }
-        const header = request.headers.authorization;
-        if (!header?.startsWith("Bearer ")) {
-          return { ...run, proof: "run" } satisfies Identity;
-        }
-        const token = header.slice("Bearer ".length);
-        const keys = yield* signingKeys(readKid(token.split(".")[0] ?? ""));
-        const payload = yield* verifyJwt(token, keys).pipe(
-          Effect.mapError(
-            (e) => new HttpError({ status: 401, message: e.message }),
-          ),
-        );
-        const claims = yield* Schema.decodeUnknownEffect(OidcClaims)(
-          payload,
-        ).pipe(
-          Effect.mapError(
-            () => new HttpError({ status: 401, message: "unexpected claims" }),
-          ),
-        );
-        const now = Math.floor(Date.now() / 1000);
-        const audiences =
-          typeof claims.aud === "string" ? [claims.aud] : claims.aud;
-        if (claims.iss !== OIDC_ISSUER) {
-          return yield* new HttpError({
-            status: 401,
-            message: "unexpected issuer",
-          });
-        }
-        if (!audiences.includes(origin)) {
-          return yield* new HttpError({
-            status: 401,
-            message: `audience must be ${origin}`,
-          });
-        }
-        if (
-          claims.exp <= now ||
-          (claims.nbf !== undefined && claims.nbf > now)
-        ) {
-          return yield* new HttpError({
-            status: 401,
-            message: "token expired",
-          });
-        }
-        if (
-          claims.repository !== run.repo ||
-          Number(claims.run_id) !== run.runId
-        ) {
-          return yield* new HttpError({
-            status: 401,
-            message: "token does not belong to the named run",
-          });
-        }
-        if (
-          !claims.job_workflow_ref.startsWith(
-            publishWorkflowRef(policy, claims.repository),
-          )
-        ) {
-          return yield* new HttpError({
-            status: 403,
-            message: `${claims.job_workflow_ref} may not publish`,
-          });
-        }
-        return { ...run, proof: "oidc" } satisfies Identity;
+        return ref;
       });
 
     /**
-     * Resolve the publishing run through GitHub; nothing about it is trusted
-     * from the client. The run must be in progress, since the request comes
-     * from inside it. A run-only proof is accepted for fork pull requests
-     * alone: everything else has an OIDC token and must present it.
+     * Resolve a run through GitHub; nothing about it is trusted from the
+     * client. The run must be in progress, since requests come from inside
+     * it. Recently resolved runs are reused so uploads do not repeat the
+     * lookup.
      */
-    const resolveRun = (identity: Identity) =>
+    const resolveRun = (ref: RunRef) =>
       Effect.gen(function* () {
+        const key = `${ref.repo}#${ref.runId}:${ref.attempt}`;
+        const cached = runs.get(key);
+        if (cached !== undefined && Date.now() - cached.at < RUN_CACHE_MS) {
+          return cached.run;
+        }
         const gh = yield* github;
-        const run = yield* GitHub.getRun(
-          gh,
-          identity.repo,
-          identity.runId,
-        ).pipe(Effect.mapError(upstream));
+        const data = yield* GitHub.getRun(gh, ref.repo, ref.runId).pipe(
+          Effect.mapError(upstream),
+        );
         if (
-          run.status !== "in_progress" ||
-          (run.run_attempt !== undefined &&
-            run.run_attempt !== identity.attempt)
+          data.status !== "in_progress" ||
+          (data.run_attempt !== undefined && data.run_attempt !== ref.attempt)
         ) {
           return yield* new HttpError({
             status: 409,
             message: "run is not in progress",
           });
         }
-        if (run.event !== "push" && run.event !== "pull_request") {
+        if (data.event !== "push" && data.event !== "pull_request") {
           return yield* new HttpError({
             status: 400,
-            message: `unsupported event ${run.event}`,
-          });
-        }
-        const headRepo =
-          run.head_repository?.full_name ?? run.repository.full_name;
-        if (
-          identity.proof === "run" &&
-          (run.event !== "pull_request" || headRepo === identity.repo)
-        ) {
-          return yield* new HttpError({
-            status: 401,
-            message:
-              "an OIDC token is required unless the run is a pull request from a fork",
+            message: `unsupported event ${data.event}`,
           });
         }
         let pr: number | null = null;
-        if (run.event === "pull_request") {
+        if (data.event === "pull_request") {
           const pulls = yield* GitHub.pullRequestsForCommit(
             gh,
-            identity.repo,
-            run.head_sha,
+            ref.repo,
+            data.head_sha,
           ).pipe(Effect.mapError(upstream));
           const first = pulls[0];
           if (first === undefined) {
             return yield* new HttpError({
               status: 404,
-              message: `no pull request has head ${run.head_sha}`,
+              message: `no pull request has head ${data.head_sha}`,
             });
           }
           pr = first.number;
         }
-        return {
-          repo: identity.repo,
-          headSha: run.head_sha,
-          headBranch: run.head_branch,
-          headRepo,
+        const run: Run = {
+          ...ref,
+          headSha: data.head_sha,
+          headBranch: data.head_branch,
+          headRepo:
+            data.head_repository?.full_name ?? data.repository.full_name,
           pr,
-        } satisfies Run;
+        };
+        runs.set(key, { run, at: Date.now() });
+        return run;
+      });
+
+    /**
+     * The proof. The job uploaded the manifest as an artifact of its run,
+     * named by the manifest's hash. Only the job can add artifacts to the
+     * run, and GitHub reports the run's artifacts to the App, so a matching
+     * name means this run vouched for exactly this manifest text.
+     */
+    const requireVouched = (run: Run, manifestText: string) =>
+      Effect.gen(function* () {
+        const expected = manifestArtifactName(yield* sha256Hex(manifestText));
+        const gh = yield* github;
+        const artifacts = yield* GitHub.listRunArtifacts(
+          gh,
+          run.repo,
+          run.runId,
+        ).pipe(Effect.mapError(upstream));
+        if (!artifacts.some((a) => a.name === expected && !a.expired)) {
+          return yield* new HttpError({
+            status: 403,
+            message: `run ${run.runId} has not vouched for this manifest (no artifact ${expected})`,
+          });
+        }
       });
 
     const validatePackage = (pkg: ManifestPackage) =>
@@ -382,14 +306,22 @@ export const make = (config: RegistryConfig) =>
           )
         : Effect.void;
 
-    const publish = (
-      identity: Identity,
-      body: PublishRequest,
-      origin: string,
-    ) =>
+    const publish = (ref: RunRef, body: PublishRequest, origin: string) =>
       Effect.gen(function* () {
-        const run = yield* resolveRun(identity);
-        const packages = body.manifest.packages;
+        const run = yield* resolveRun(ref);
+        yield* requireVouched(run, body.manifest);
+        const manifest = yield* Schema.decodeUnknownEffect(ManifestJson)(
+          body.manifest,
+        ).pipe(
+          Effect.mapError(
+            (e) =>
+              new HttpError({
+                status: 400,
+                message: `invalid manifest: ${String(e)}`,
+              }),
+          ),
+        );
+        const packages = manifest.packages;
         yield* Effect.forEach(packages, validatePackage);
 
         const present = yield* Effect.forEach(
@@ -468,9 +400,9 @@ export const make = (config: RegistryConfig) =>
       });
 
     /**
-     * Content-addressed upload. Any allowed repository may upload; bytes only
-     * become reachable once a verified publication tags them, and untagged
-     * objects are swept after a day.
+     * Content-addressed upload. Any in-progress run of an allowed repository
+     * may upload; bytes only become reachable once a vouched manifest tags
+     * them, and untagged objects are swept after a day.
      */
     const uploadTarball = (
       request: HttpServerRequest,
@@ -619,7 +551,7 @@ export const make = (config: RegistryConfig) =>
 
       if (url.pathname.startsWith("/api/")) {
         if (method === "POST" && url.pathname === "/api/publish") {
-          const identity = yield* authenticate(request, origin);
+          const ref = yield* runRef(request);
           const body = yield* request.json.pipe(
             Effect.flatMap(Schema.decodeUnknownEffect(PublishRequest)),
             Effect.mapError(
@@ -630,13 +562,13 @@ export const make = (config: RegistryConfig) =>
                 }),
             ),
           );
-          return yield* publish(identity, body, origin);
+          return yield* publish(ref, body, origin);
         }
         const upload = url.pathname.match(
           /^\/api\/tarballs\/(.+)\/([a-f0-9]{64})$/,
         );
         if (method === "PUT" && upload) {
-          yield* authenticate(request, origin);
+          yield* resolveRun(yield* runRef(request));
           const name = decodeURIComponent(upload[1]!);
           return yield* HttpServerResponse.json(
             yield* uploadTarball(request, name, upload[2]!),
@@ -712,17 +644,3 @@ export const make = (config: RegistryConfig) =>
       ),
     };
   }).pipe(Effect.provide(bindings));
-
-/** `kid` from a compact JWT's base64url header, without verifying anything. */
-const readKid = (rawHeader: string): string | undefined => {
-  const bytes = Encoding.decodeBase64Url(rawHeader);
-  if (Result.isFailure(bytes)) return undefined;
-  try {
-    const header = JSON.parse(new TextDecoder().decode(bytes.success)) as {
-      kid?: unknown;
-    };
-    return typeof header.kid === "string" ? header.kid : undefined;
-  } catch {
-    return undefined;
-  }
-};

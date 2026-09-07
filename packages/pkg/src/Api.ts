@@ -1,12 +1,10 @@
 import * as Schema from "effect/Schema";
-import { Manifest } from "./Manifest.ts";
 
 /**
  * Header naming the GitHub Actions run a request comes from, as
- * `owner/repo#<run id>:<attempt>`. Sent on every request. When the job has
- * an OIDC token it also sends `Authorization: Bearer <token>`, which must
- * agree with the header; without one the registry verifies the run through
- * the GitHub API and accepts it only for pull requests from forks.
+ * `owner/repo#<run id>:<attempt>`. It is a lookup hint, not a credential:
+ * the registry resolves the run through the GitHub API and trusts only what
+ * GitHub says about it.
  */
 export const RUN_HEADER = "x-github-run";
 
@@ -21,12 +19,22 @@ export const parseRunHeader = (value: string) => {
 };
 
 /**
- * `POST /api/publish`. Idempotent: the registry verifies the run, checks
- * every tarball is present, and either answers 409 with the missing ones or
- * writes the tags and answers 200.
+ * Name of the artifact a job uploads to its own run to vouch for a manifest.
+ * Only the job holds the runtime token that can add artifacts to the run, so
+ * an artifact carrying the manifest's hash is GitHub's record that this run
+ * approved exactly these package hashes.
+ */
+export const manifestArtifactName = (sha256: string) =>
+  `pkg-manifest-${sha256}`;
+
+/**
+ * `POST /api/publish`. `manifest` is the exact `pkg-manifest.json` text the
+ * job vouched for; its SHA-256 must match an artifact on the run. Idempotent:
+ * the registry either answers 409 with the tarballs it lacks or writes the
+ * tags and answers 200.
  */
 export const PublishRequest = Schema.Struct({
-  manifest: Manifest,
+  manifest: Schema.String,
 });
 export type PublishRequest = typeof PublishRequest.Type;
 

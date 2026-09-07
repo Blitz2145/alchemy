@@ -26,9 +26,6 @@ export const RegistryConfig = Schema.Struct({
 });
 export type RegistryConfig = typeof RegistryConfig.Type;
 
-export const OIDC_ISSUER = "https://token.actions.githubusercontent.com";
-export const OIDC_JWKS_URL = `${OIDC_ISSUER}/.well-known/jwks`;
-
 /** Marker that identifies the sticky install comment. */
 export const COMMENT_MARKER = "<!-- pkg-preview-comment -->";
 

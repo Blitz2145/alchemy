@@ -1,10 +1,11 @@
 name: Package Preview
 
 # Builds, packs, and publishes preview packages from the job that built them.
-# Same-repo runs prove themselves to the registry with the job's OIDC token.
-# Fork pull requests get no OIDC token from GitHub; for those the registry
-# verifies through the GitHub API that the named run is in progress on a
-# fork, and only ever tags under that run's own pull request.
+# The job proves it is the run it claims to be by uploading the manifest as
+# an artifact of its own run, which only the job's runtime token can do; the
+# registry reads the artifact list back through the GitHub API. That works
+# the same for pushes, same-repo pull requests, and fork pull requests, and
+# needs no permissions or secrets.
 
 on:
   push:
@@ -31,11 +32,8 @@ on:
       - "tsconfig.json"
       - ".github/workflows/pkg.yml"
 
-# id-token is only granted to same-repo runs; fork pull requests silently get
-# none and fall back to run verification.
 permissions:
   contents: read
-  id-token: write
 
 concurrency:
   group: pkg-${{ github.event.pull_request.number || github.ref }}

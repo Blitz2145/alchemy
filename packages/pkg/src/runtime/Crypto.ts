@@ -2,25 +2,22 @@ import * as Data from "effect/Data";
 import * as Effect from "effect/Effect";
 import * as Encoding from "effect/Encoding";
 import * as Result from "effect/Result";
-import * as Schema from "effect/Schema";
 
 export class CryptoError extends Data.TaggedError("CryptoError")<{
   readonly message: string;
 }> {}
 
 const encoder = new TextEncoder();
-const decoder = new TextDecoder();
 
-const decoded = (
-  result: Result.Result<Uint8Array, unknown>,
-  message: string,
-): Effect.Effect<Uint8Array, CryptoError> =>
-  Result.isSuccess(result)
-    ? Effect.succeed(result.success)
-    : Effect.fail(new CryptoError({ message }));
-
-const decodeBase64Url = (text: string) =>
-  decoded(Encoding.decodeBase64Url(text), "malformed base64url");
+/** Lowercase hex SHA-256 of a string. */
+export const sha256Hex = (text: string) =>
+  Effect.promise(async () =>
+    Encoding.encodeHex(
+      new Uint8Array(
+        await crypto.subtle.digest("SHA-256", encoder.encode(text)),
+      ),
+    ),
+  );
 
 /** DER length prefix. */
 const derLength = (length: number): number[] => {
@@ -67,10 +64,11 @@ export const importPrivateKey = (pem: string) =>
     if (!match) {
       return yield* new CryptoError({ message: "not an RSA private key PEM" });
     }
-    const der = yield* decoded(
-      Encoding.decodeBase64(match[2]!.replace(/\s+/g, "")),
-      "private key is not base64",
-    );
+    const decoded = Encoding.decodeBase64(match[2]!.replace(/\s+/g, ""));
+    if (Result.isFailure(decoded)) {
+      return yield* new CryptoError({ message: "private key is not base64" });
+    }
+    const der = decoded.success;
     const pkcs8 = match[1] ? pkcs1ToPkcs8(der) : Uint8Array.from(der);
     return yield* Effect.tryPromise({
       try: () =>
@@ -86,16 +84,12 @@ export const importPrivateKey = (pem: string) =>
     });
   });
 
-/** Sign a compact RS256 JWT. */
-export const signJwt = (
-  claims: Record<string, unknown>,
-  key: CryptoKey,
-  kid?: string,
-) =>
+/** Sign a compact RS256 JWT, used to authenticate as the GitHub App. */
+export const signJwt = (claims: Record<string, unknown>, key: CryptoKey) =>
   Effect.tryPromise({
     try: async () => {
       const header = Encoding.encodeBase64Url(
-        JSON.stringify({ alg: "RS256", typ: "JWT", ...(kid ? { kid } : {}) }),
+        JSON.stringify({ alg: "RS256", typ: "JWT" }),
       );
       const payload = Encoding.encodeBase64Url(JSON.stringify(claims));
       const input = `${header}.${payload}`;
@@ -107,80 +101,4 @@ export const signJwt = (
       return `${input}.${Encoding.encodeBase64Url(new Uint8Array(signature))}`;
     },
     catch: (cause) => new CryptoError({ message: `signing failed: ${cause}` }),
-  });
-
-export const Jwk = Schema.Struct({
-  kid: Schema.optionalKey(Schema.String),
-  kty: Schema.String,
-  alg: Schema.optionalKey(Schema.String),
-  n: Schema.optionalKey(Schema.String),
-  e: Schema.optionalKey(Schema.String),
-  use: Schema.optionalKey(Schema.String),
-});
-export type Jwk = typeof Jwk.Type;
-
-export const Jwks = Schema.Struct({ keys: Schema.Array(Jwk) });
-
-const JwtHeader = Schema.fromJsonString(
-  Schema.Struct({
-    alg: Schema.String,
-    kid: Schema.optionalKey(Schema.String),
-  }),
-);
-
-/**
- * Verify a compact RS256 JWT against a JWKS and return its raw payload. The
- * caller decodes the payload with the claims schema it expects.
- */
-export const verifyJwt = (token: string, keys: ReadonlyArray<Jwk>) =>
-  Effect.gen(function* () {
-    const parts = token.split(".");
-    if (parts.length !== 3) {
-      return yield* new CryptoError({ message: "malformed token" });
-    }
-    const [rawHeader, rawPayload, rawSignature] = parts as [
-      string,
-      string,
-      string,
-    ];
-    const header = yield* Schema.decodeUnknownEffect(JwtHeader)(
-      decoder.decode(yield* decodeBase64Url(rawHeader)),
-    ).pipe(
-      Effect.mapError(
-        () => new CryptoError({ message: "malformed token header" }),
-      ),
-    );
-    if (header.alg !== "RS256") {
-      return yield* new CryptoError({
-        message: `unsupported algorithm ${header.alg}`,
-      });
-    }
-    const jwk = keys.find((k) => k.kid === header.kid && k.kty === "RSA");
-    if (jwk === undefined) {
-      return yield* new CryptoError({ message: "unknown signing key" });
-    }
-    const signature = yield* decodeBase64Url(rawSignature);
-    const valid = yield* Effect.tryPromise({
-      try: async () => {
-        const key = await crypto.subtle.importKey(
-          "jwk",
-          { kty: jwk.kty, n: jwk.n, e: jwk.e, alg: "RS256", ext: true },
-          { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" },
-          false,
-          ["verify"],
-        );
-        return await crypto.subtle.verify(
-          "RSASSA-PKCS1-v1_5",
-          key,
-          Uint8Array.from(signature),
-          encoder.encode(`${rawHeader}.${rawPayload}`),
-        );
-      },
-      catch: (cause) =>
-        new CryptoError({ message: `verification failed: ${cause}` }),
-    });
-    if (!valid) {
-      return yield* new CryptoError({ message: "invalid signature" });
-    }
-    return decoder.decode(yield* decodeBase64Url(rawPayload));
   });

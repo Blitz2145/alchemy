@@ -1,6 +1,6 @@
 # @alchemy.run/pkg
 
-Preview packages for pull requests. A Cloudflare Worker registry authenticated by GitHub Actions OIDC, plus the `pkg` CLI that packs workspace packages and publishes them from CI.
+Preview packages for pull requests. A Cloudflare Worker registry that verifies every publication against the GitHub Actions run that produced it, plus the `pkg` CLI that packs workspace packages and publishes them from CI.
 
 Install URLs look like `https://pkg.ing/<name>@<tag>` where `<tag>` is a commit SHA, a short SHA, `branch:<name>`, or `pr:<number>`.
 
@@ -8,9 +8,10 @@ Install URLs look like `https://pkg.ing/<name>@<tag>` where `<tag>` is a commit 
 
 Every publication is a GitHub Actions **run**. The registry never trusts what a client says about commits, branches, or pull requests; it resolves the run through the GitHub API and derives every tag from that.
 
-1. One workflow runs on `push` and `pull_request`, builds the workspace, and runs `pkg publish`, which packs and publishes from the same job. Fork pull requests run it too, since a fork's PR workflow runs inside the upstream repository's Actions.
-2. Every request names the run (`owner/repo#<run id>:<attempt>`). Same-repo jobs also present their OIDC token, which must belong to that run and come from the publishing workflow file. GitHub issues no token to fork pull requests, so for those the registry accepts the run name alone, after confirming through the API that the run is in progress and is a pull request from a fork. That proof is weaker, but it can only ever tag under that pull request.
-3. One idempotent `POST /api/publish` either answers 409 with the tarballs it lacks, which the CLI uploads before publishing again, or points the tags, posts a "Preview packages" check run on the commit, and for pull requests updates the comment. The App needs `checks: write`, `pull_requests: write`, and `actions: read`.
+1. One workflow runs on `push` and `pull_request`, builds the workspace, and runs `pkg publish`, which packs and publishes from the same job. It needs no permissions and no secrets, so fork pull requests run it exactly like everything else.
+2. Before talking to the registry, the CLI uploads the manifest it is about to send as an artifact of its own run, named `pkg-manifest-<sha256 of the manifest>`. Only the job's runtime token can add artifacts to the run, so that artifact is GitHub's record that this run vouched for exactly these package hashes.
+3. Requests carry the run as a hint (`owner/repo#<run id>:<attempt>`) and nothing else. The registry fetches the run through the App, requires it to be in progress, lists its artifacts, and refuses any manifest whose hash is not vouched for. Someone naming another run can only ever get that run's own manifest accepted, which changes nothing.
+4. One idempotent `POST /api/publish` either answers 409 with the tarballs it lacks, which the CLI uploads before publishing again, or points the tags, posts a "Preview packages" check run on the commit, and for pull requests updates the comment. The App needs `checks: write`, `pull_requests: write`, and `actions: read`.
 
 ## `pkg publish` and `pkg pack`
 
@@ -46,8 +47,6 @@ The Worker is configured with plain data, validated by the `Policy` schema expor
 ```
 
 `repos` lists the repositories allowed to publish. A publication may contain any package; every package gets the commit, short commit, `branch:<name>`, and `pr:<number>` tags of the run that produced it. A package packed from a submodule is tagged by the submodule's commit, which is what the rewritten dependency URLs in the other tarballs point at.
-
-OIDC tokens must come from `.github/workflows/pkg.yml` in the repository, on any ref; `workflow` overrides the file name.
 
 ## Cleanup
 

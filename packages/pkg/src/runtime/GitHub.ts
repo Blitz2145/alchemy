@@ -110,6 +110,22 @@ export const getRun = (options: GitHubOptions, repo: string, runId: number) =>
     Actions.getWorkflowRun({ ...split(repo), run_id: runId }),
   );
 
+/** Artifacts uploaded to a run so far, including by jobs still in progress. */
+export const listRunArtifacts = (
+  options: GitHubOptions,
+  repo: string,
+  runId: number,
+) =>
+  asInstallation(
+    options,
+    repo,
+    Actions.listWorkflowRunArtifacts({
+      ...split(repo),
+      run_id: runId,
+      per_page: 100,
+    }),
+  ).pipe(Effect.map((page) => page.artifacts));
+
 /** Pull requests in `repo` whose head is `sha`. */
 export const pullRequestsForCommit = (
   options: GitHubOptions,

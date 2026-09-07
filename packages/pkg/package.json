@@ -57,6 +57,7 @@
     }
   },
   "dependencies": {
+    "@actions/artifact": "^2.3.2",
     "@distilled.cloud/github": "workspace:*",
     "alchemy": "workspace:*",
     "effect": "catalog:effect",
