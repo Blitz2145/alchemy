@@ -1,5 +1,4 @@
 import { Registry } from "@alchemy.run/pkg";
-import * as Config from "effect/Config";
 import * as Duration from "effect/Duration";
 
 /**
@@ -11,13 +10,11 @@ import * as Duration from "effect/Duration";
  * This file is the Worker's bundle entry, so it must stay free of the stack
  * definition: importing `alchemy` here would pull the CLI into the Worker.
  */
-export default Registry("PkgRegistry", {
+export default Registry("Registry", {
   main: import.meta.url,
   domain: "staging.pkg.ing",
-  github: {
-    appId: Config.string("PKG_GITHUB_APP_ID"),
-    privateKey: Config.redacted("PKG_GITHUB_APP_PRIVATE_KEY"),
-  },
+  // Deploy-time variables, bound to the Worker under the same names.
+  github: { appId: "GH_APP_ID", privateKey: "GH_APP_PRIVATE_KEY" },
   policy: {
     repos: ["alchemy-run/alchemy", "alchemy-run/distilled"],
     ttl: Duration.weeks(1),

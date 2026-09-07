@@ -4,7 +4,7 @@ import * as Effect from "effect/Effect";
 import Registry from "./pkg/Registry.ts";
 
 export default Alchemy.Stack(
-  "Pkg",
+  "AlchemyPkg",
   {
     providers: Cloudflare.providers(),
     state: Cloudflare.state(),

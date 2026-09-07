@@ -16,17 +16,15 @@ export const RegistryConfig = Schema.Struct({
   aliases: Schema.Record(Schema.String, Schema.String),
   github: Schema.Struct({
     apiUrl: Schema.String,
+    /** Worker env var holding the GitHub App id. */
+    appIdEnv: Schema.String,
+    /** Worker secret env var holding the GitHub App private key PEM. */
+    privateKeyEnv: Schema.String,
   }),
   /** Cron expression for the expiry sweep. */
   cron: Schema.String,
 });
 export type RegistryConfig = typeof RegistryConfig.Type;
-
-/** Worker env var holding the GitHub App id. */
-export const APP_ID_ENV = "PKG_GITHUB_APP_ID";
-
-/** Worker secret env var holding the GitHub App private key PEM. */
-export const PRIVATE_KEY_ENV = "PKG_GITHUB_APP_PRIVATE_KEY";
 
 export const OIDC_ISSUER = "https://token.actions.githubusercontent.com";
 export const OIDC_JWKS_URL = `${OIDC_ISSUER}/.well-known/jwks`;

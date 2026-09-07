@@ -22,12 +22,10 @@ import {
 import type { ManifestPackage } from "../Manifest.ts";
 import { publishWorkflowRef, type Policy } from "../Policy.ts";
 import {
-  APP_ID_ENV,
   COMMENT_MARKER,
   OIDC_ISSUER,
   OIDC_JWKS_URL,
   ORPHAN_GRACE_MS,
-  PRIVATE_KEY_ENV,
   SWEEP_LOOKAHEAD_MS,
   type RegistryConfig,
 } from "./Config.ts";
@@ -186,13 +184,13 @@ export const make = (config: RegistryConfig) =>
 
     const github = Effect.gen(function* () {
       if (appKey === undefined) {
-        const pem = yield* Config.redacted(PRIVATE_KEY_ENV);
+        const pem = yield* Config.redacted(config.github.privateKeyEnv);
         appKey = yield* importPrivateKey(Redacted.value(pem));
       }
       return {
         http,
         apiUrl: config.github.apiUrl,
-        appId: yield* Config.string(APP_ID_ENV),
+        appId: yield* Config.string(config.github.appIdEnv),
         key: appKey,
       } satisfies GitHub.GitHubOptions;
     });
