@@ -54,31 +54,24 @@ export const packCommand = Command.make(
   ]),
 );
 
-const runFlag = Flag.integer("run").pipe(
-  Flag.withDescription(
-    "Id of the build workflow run whose artifact is being published (github.event.workflow_run.id)",
-  ),
-);
-
-const dirFlag = Flag.string("dir").pipe(
-  Flag.withDescription("Directory holding the pkg pack artifact"),
-  Flag.withDefault(".pkg"),
-);
-
 export const publishCommand = Command.make(
   "publish",
-  { run: runFlag, registry: registryFlag, dir: dirFlag },
-  ({ run, registry, dir }) =>
+  { group: groupFlag, registry: registryFlag, out: outFlag },
+  ({ group, registry, out }) =>
     Effect.gen(function* () {
+      const groups = yield* parseGroups(group);
       const cwd = yield* Effect.sync(() => process.cwd());
-      yield* publish({ cwd, dir, registry, runId: run });
+      yield* publish({ cwd, groups, registry, out });
     }),
 ).pipe(
   Command.withDescription(
-    "Publish a packed artifact to the registry using the job's GitHub Actions OIDC token",
+    "Pack workspace packages and publish them to the registry from the current GitHub Actions job",
   ),
   Command.withExamples([
-    { command: "pkg publish --run ${{ github.event.workflow_run.id }}" },
+    {
+      command:
+        "pkg publish --group Alchemy=./packages/* --group Distilled=./submodules/distilled/packages/*",
+    },
   ]),
 );
 

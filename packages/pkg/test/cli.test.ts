@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 import * as Duration from "effect/Duration";
+import { parseRunHeader, runHeader } from "../src/Api.ts";
 import { Policy, publishWorkflowRef } from "../src/Policy.ts";
 import { installUrl, rewriteDependencies } from "../src/cli/tarball.ts";
 import { expandBraces, parseGroup } from "../src/cli/workspace.ts";
@@ -15,11 +16,11 @@ describe("Policy", () => {
   test("ttl decodes to a Duration and workflow ref defaults", () => {
     expect(Duration.toMillis(policy.ttl!)).toBe(7 * 24 * 60 * 60 * 1000);
     expect(publishWorkflowRef(policy, "alchemy-run/alchemy")).toBe(
-      "alchemy-run/alchemy/.github/workflows/pkg-publish.yml@refs/heads/main",
+      "alchemy-run/alchemy/.github/workflows/pkg.yml@",
     );
     expect(
       publishWorkflowRef({ ...policy, workflow: "publish.yml" }, "a/b"),
-    ).toBe("a/b/.github/workflows/publish.yml@refs/heads/main");
+    ).toBe("a/b/.github/workflows/publish.yml@");
   });
 });
 
@@ -88,5 +89,19 @@ describe("tarball", () => {
       "@alchemy.run/frontend-frameworks",
       "@distilled.cloud/core",
     ]);
+  });
+});
+
+describe("Api", () => {
+  test("run header round trip", () => {
+    const value = runHeader("alchemy-run/alchemy", 34124813301, 2);
+    expect(value).toBe("alchemy-run/alchemy#34124813301:2");
+    expect(parseRunHeader(value)).toEqual({
+      repo: "alchemy-run/alchemy",
+      runId: 34124813301,
+      attempt: 2,
+    });
+    expect(parseRunHeader("nope")).toBeUndefined();
+    expect(parseRunHeader("alchemy-run/alchemy#x:1")).toBeUndefined();
   });
 });

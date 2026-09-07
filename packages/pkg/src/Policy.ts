@@ -21,18 +21,17 @@ export const Policy = Schema.Struct({
   /** Upper bound on a single tarball, in bytes. Absent means unlimited. */
   maxPackageSize: Schema.optionalKey(Schema.Number),
   /**
-   * File name of the publish workflow. Only OIDC tokens whose
-   * `job_workflow_ref` is this file on the repository's `main` branch may
-   * publish.
-   * @default "pkg-publish.yml"
+   * File name of the publishing workflow. OIDC tokens must come from this
+   * workflow file in the repository, on any ref.
+   * @default "pkg.yml"
    */
   workflow: Schema.optionalKey(Schema.String),
 });
 export type Policy = typeof Policy.Type;
 export type PolicyInput = typeof Policy.Encoded;
 
-export const DEFAULT_WORKFLOW = "pkg-publish.yml";
+export const DEFAULT_WORKFLOW = "pkg.yml";
 
-/** The `job_workflow_ref` claim allowed to publish for `repo`. */
+/** Prefix a `job_workflow_ref` claim must have to publish for `repo`. */
 export const publishWorkflowRef = (policy: Policy, repo: string) =>
-  `${repo}/.github/workflows/${policy.workflow ?? DEFAULT_WORKFLOW}@refs/heads/main`;
+  `${repo}/.github/workflows/${policy.workflow ?? DEFAULT_WORKFLOW}@`;

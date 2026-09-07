@@ -8,11 +8,13 @@ Install URLs look like `https://pkg.ing/<name>@<tag>` where `<tag>` is a commit 
 
 Every publication is a GitHub Actions **run**. The registry never trusts what a client says about commits, branches, or pull requests; it resolves the run through the GitHub API and derives every tag from that.
 
-1. **Build** runs on `push` and `pull_request` with no permissions. It builds the workspace, runs `pkg pack`, and uploads the output directory as an artifact. Fork pull requests run here too, since a fork's PR workflow runs inside the upstream repository's Actions.
-2. **Publish** is a `workflow_run` workflow on the default branch with `id-token: write`. It downloads the artifact from the triggering run and runs `pkg publish` with an OIDC token. It never checks out code, so nothing from a fork executes with a credential.
-3. The **Worker** verifies the OIDC token against the pinned publish workflow, resolves the triggering run to its head commit, branch, and pull request, and checks the manifest against policy. One idempotent `POST /api/publish` either answers 409 with the tarballs it lacks, which the CLI uploads before publishing again, or points the tags, posts a "Preview packages" check run on the commit, and for pull requests updates the comment. The App needs `checks: write`, `pull_requests: write`, and `actions: read`.
+1. One workflow runs on `push` and `pull_request`, builds the workspace, and runs `pkg publish`, which packs and publishes from the same job. Fork pull requests run it too, since a fork's PR workflow runs inside the upstream repository's Actions.
+2. Every request names the run (`owner/repo#<run id>:<attempt>`). Same-repo jobs also present their OIDC token, which must belong to that run and come from the publishing workflow file. GitHub issues no token to fork pull requests, so for those the registry accepts the run name alone, after confirming through the API that the run is in progress and is a pull request from a fork. That proof is weaker, but it can only ever tag under that pull request.
+3. One idempotent `POST /api/publish` either answers 409 with the tarballs it lacks, which the CLI uploads before publishing again, or points the tags, posts a "Preview packages" check run on the commit, and for pull requests updates the comment. The App needs `checks: write`, `pull_requests: write`, and `actions: read`.
 
-## `pkg pack`
+## `pkg publish` and `pkg pack`
+
+`pkg publish` takes the same flags as `pack`, packs into `--out`, and publishes the result from the current job. `pack` alone is useful to inspect what would be published.
 
 ```sh
 pkg pack \
@@ -45,7 +47,7 @@ The Worker is configured with plain data, validated by the `Policy` schema expor
 
 `repos` lists the repositories allowed to publish. A publication may contain any package; every package gets the commit, short commit, `branch:<name>`, and `pr:<number>` tags of the run that produced it. A package packed from a submodule is tagged by the submodule's commit, which is what the rewritten dependency URLs in the other tarballs point at.
 
-Only OIDC tokens from `.github/workflows/pkg-publish.yml` on each repository's `main` branch may publish; `workflow` overrides the file name.
+OIDC tokens must come from `.github/workflows/pkg.yml` in the repository, on any ref; `workflow` overrides the file name.
 
 ## Cleanup
 

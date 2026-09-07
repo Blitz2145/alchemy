@@ -15,8 +15,10 @@ import { HttpServerRequest } from "effect/unstable/http/HttpServerRequest";
 import * as HttpServerResponse from "effect/unstable/http/HttpServerResponse";
 import {
   MissingResponse,
+  parseRunHeader,
   PublishRequest,
   PublishResponse,
+  RUN_HEADER,
   TarballResponse,
 } from "../Api.ts";
 import type { ManifestPackage } from "../Manifest.ts";
@@ -52,8 +54,17 @@ const OidcClaims = Schema.fromJsonString(
   }),
 );
 
+/**
+ * Who is publishing. `oidc` means the job presented a verified OIDC token
+ * for this run. `run` means it only named the run, which the registry then
+ * verifies through the GitHub API and accepts solely for fork pull requests,
+ * since GitHub issues those jobs no token.
+ */
 interface Identity {
   readonly repo: string;
+  readonly runId: number;
+  readonly attempt: number;
+  readonly proof: "oidc" | "run";
 }
 
 /** What the registry learned about a build run from GitHub. */
@@ -217,12 +228,22 @@ export const make = (config: RegistryConfig) =>
 
     const authenticate = (request: HttpServerRequest, origin: string) =>
       Effect.gen(function* () {
-        const header = request.headers.authorization;
-        if (!header?.startsWith("Bearer ")) {
+        const run = parseRunHeader(request.headers[RUN_HEADER] ?? "");
+        if (run === undefined) {
           return yield* new HttpError({
             status: 401,
-            message: "missing bearer token",
+            message: `${RUN_HEADER} header is required`,
           });
+        }
+        if (!policy.repos.includes(run.repo)) {
+          return yield* new HttpError({
+            status: 403,
+            message: `${run.repo} may not publish`,
+          });
+        }
+        const header = request.headers.authorization;
+        if (!header?.startsWith("Bearer ")) {
+          return { ...run, proof: "run" } satisfies Identity;
         }
         const token = header.slice("Bearer ".length);
         const keys = yield* signingKeys(readKid(token.split(".")[0] ?? ""));
@@ -262,41 +283,68 @@ export const make = (config: RegistryConfig) =>
             message: "token expired",
           });
         }
-        if (!policy.repos.includes(claims.repository)) {
+        if (
+          claims.repository !== run.repo ||
+          Number(claims.run_id) !== run.runId
+        ) {
           return yield* new HttpError({
-            status: 403,
-            message: `${claims.repository} may not publish`,
+            status: 401,
+            message: "token does not belong to the named run",
           });
         }
         if (
-          claims.job_workflow_ref !==
-          publishWorkflowRef(policy, claims.repository)
+          !claims.job_workflow_ref.startsWith(
+            publishWorkflowRef(policy, claims.repository),
+          )
         ) {
           return yield* new HttpError({
             status: 403,
             message: `${claims.job_workflow_ref} may not publish`,
           });
         }
-        return { repo: claims.repository } satisfies Identity;
+        return { ...run, proof: "oidc" } satisfies Identity;
       });
 
-    /** Resolve a build run through GitHub; nothing about it is trusted from the client. */
-    const resolveRun = (identity: Identity, runId: number) =>
+    /**
+     * Resolve the publishing run through GitHub; nothing about it is trusted
+     * from the client. The run must be in progress, since the request comes
+     * from inside it. A run-only proof is accepted for fork pull requests
+     * alone: everything else has an OIDC token and must present it.
+     */
+    const resolveRun = (identity: Identity) =>
       Effect.gen(function* () {
         const gh = yield* github;
-        const run = yield* GitHub.getRun(gh, identity.repo, runId).pipe(
-          Effect.mapError(upstream),
-        );
-        if (run.status !== "completed" || run.conclusion !== "success") {
+        const run = yield* GitHub.getRun(
+          gh,
+          identity.repo,
+          identity.runId,
+        ).pipe(Effect.mapError(upstream));
+        if (
+          run.status !== "in_progress" ||
+          (run.run_attempt !== undefined &&
+            run.run_attempt !== identity.attempt)
+        ) {
           return yield* new HttpError({
             status: 409,
-            message: "run has not completed successfully",
+            message: "run is not in progress",
           });
         }
         if (run.event !== "push" && run.event !== "pull_request") {
           return yield* new HttpError({
             status: 400,
             message: `unsupported event ${run.event}`,
+          });
+        }
+        const headRepo =
+          run.head_repository?.full_name ?? run.repository.full_name;
+        if (
+          identity.proof === "run" &&
+          (run.event !== "pull_request" || headRepo === identity.repo)
+        ) {
+          return yield* new HttpError({
+            status: 401,
+            message:
+              "an OIDC token is required unless the run is a pull request from a fork",
           });
         }
         let pr: number | null = null;
@@ -319,7 +367,7 @@ export const make = (config: RegistryConfig) =>
           repo: identity.repo,
           headSha: run.head_sha,
           headBranch: run.head_branch,
-          headRepo: run.head_repository?.full_name ?? run.repository.full_name,
+          headRepo,
           pr,
         } satisfies Run;
       });
@@ -340,7 +388,7 @@ export const make = (config: RegistryConfig) =>
       origin: string,
     ) =>
       Effect.gen(function* () {
-        const run = yield* resolveRun(identity, body.runId);
+        const run = yield* resolveRun(identity);
         const packages = body.manifest.packages;
         yield* Effect.forEach(packages, validatePackage);
 

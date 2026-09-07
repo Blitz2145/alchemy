@@ -12,55 +12,65 @@ import {
   MissingResponse,
   PublishRequest,
   PublishResponse,
+  RUN_HEADER,
+  runHeader,
   TarballResponse,
   tarballPath,
 } from "../Api.ts";
-import { MANIFEST_FILE, ManifestJson, type Manifest } from "../Manifest.ts";
+import type { Manifest } from "../Manifest.ts";
+import { pack, type PackOptions } from "./pack.ts";
 
 export class PublishError extends Data.TaggedError("PublishError")<{
   readonly message: string;
 }> {}
 
-export interface PublishOptions {
-  readonly cwd: string;
-  readonly dir: string;
-  readonly registry: string;
-  readonly runId: number;
-}
+export type PublishOptions = PackOptions;
 
 const IdToken = Schema.Struct({ value: Schema.String });
 
 /**
- * Mint a GitHub Actions OIDC token for the registry. The request URL and
- * bearer token are injected by the runner when the job has `id-token: write`.
+ * The GitHub Actions run this job belongs to, from the runner's environment.
+ */
+const currentRun = Effect.gen(function* () {
+  const repo = process.env.GITHUB_REPOSITORY;
+  const runId = Number(process.env.GITHUB_RUN_ID);
+  const attempt = Number(process.env.GITHUB_RUN_ATTEMPT ?? "1");
+  if (!repo || !Number.isSafeInteger(runId)) {
+    return yield* new PublishError({
+      message: "pkg publish must run inside a GitHub Actions job",
+    });
+  }
+  return { repo, runId, attempt };
+});
+
+/**
+ * Mint a GitHub Actions OIDC token for the registry, or `undefined` when the
+ * runner offers none. GitHub grants no token to pull requests from forks;
+ * those jobs are verified by the registry through the GitHub API instead.
  */
 const idToken = (audience: string) =>
   Effect.gen(function* () {
     const requestUrl = process.env.ACTIONS_ID_TOKEN_REQUEST_URL;
     const requestToken = process.env.ACTIONS_ID_TOKEN_REQUEST_TOKEN;
-    if (!requestUrl || !requestToken) {
-      return yield* new PublishError({
-        message:
-          "no OIDC token available: run inside GitHub Actions with `id-token: write`",
-      });
-    }
+    if (!requestUrl || !requestToken) return undefined;
     const http = yield* HttpClient.HttpClient;
-    const response = yield* http
+    return yield* http
       .execute(
         HttpClientRequest.get(requestUrl).pipe(
           HttpClientRequest.appendUrlParam("audience", audience),
           HttpClientRequest.bearerToken(requestToken),
         ),
       )
-      .pipe(Effect.flatMap((r) => r.json))
-      .pipe(Effect.flatMap(Schema.decodeUnknownEffect(IdToken)))
       .pipe(
-        Effect.mapError(
-          (e) =>
-            new PublishError({ message: `OIDC token request failed: ${e}` }),
+        Effect.flatMap((r) => r.json),
+        Effect.flatMap(Schema.decodeUnknownEffect(IdToken)),
+        Effect.map((r): string | undefined => r.value),
+        Effect.catch((e) =>
+          Console.warn(
+            `OIDC token unavailable, falling back to run verification: ${e}`,
+          ).pipe(Effect.as(undefined)),
         ),
       );
-    return response.value;
   });
 
 const bodyJson = (
@@ -102,9 +112,10 @@ const decodeResponse = <S extends Schema.Top>(
   });
 
 /**
- * Publish a `pkg pack` artifact. The registry verifies the build run and
- * either reports the tarballs it lacks, which are uploaded before trying
- * again, or writes the tags.
+ * Pack the workspace and publish it from the current GitHub Actions job.
+ * Every request names the run; same-repo jobs also carry an OIDC token. The
+ * registry verifies the run and either reports the tarballs it lacks, which
+ * are uploaded before trying again, or writes the tags.
  */
 export const publish = Effect.fn("publish")(function* (
   options: PublishOptions,
@@ -113,22 +124,27 @@ export const publish = Effect.fn("publish")(function* (
   const path = yield* Path.Path;
   const http = yield* HttpClient.HttpClient;
   const registry = options.registry.replace(/\/+$/, "");
-  const dir = path.resolve(options.cwd, options.dir);
+  const run = yield* currentRun;
 
-  const manifest = yield* fs
-    .readFileString(path.join(dir, MANIFEST_FILE))
-    .pipe(Effect.flatMap(Schema.decodeUnknownEffect(ManifestJson)));
-  if (manifest.registry !== registry) {
-    return yield* new PublishError({
-      message: `artifact was packed for ${manifest.registry}, not ${registry}`,
-    });
-  }
+  const manifest = yield* pack(options);
+  if (manifest === undefined) return undefined;
+  const dir = path.resolve(options.cwd, options.out);
 
   const send = (request: HttpClientRequest.HttpClientRequest) =>
     Effect.gen(function* () {
       const token = yield* idToken(registry);
+      const named = request.pipe(
+        HttpClientRequest.setHeader(
+          RUN_HEADER,
+          runHeader(run.repo, run.runId, run.attempt),
+        ),
+      );
       return yield* http
-        .execute(request.pipe(HttpClientRequest.bearerToken(token)))
+        .execute(
+          token === undefined
+            ? named
+            : named.pipe(HttpClientRequest.bearerToken(token)),
+        )
         .pipe(
           Effect.mapError(
             (e) => new PublishError({ message: `request failed: ${e}` }),
@@ -145,10 +161,7 @@ export const publish = Effect.fn("publish")(function* (
       const response = yield* send(
         HttpClientRequest.post(`${registry}/api/publish`).pipe(
           HttpClientRequest.bodyJsonUnsafe(
-            Schema.encodeUnknownSync(PublishRequest)({
-              runId: options.runId,
-              manifest,
-            }),
+            Schema.encodeUnknownSync(PublishRequest)({ manifest }),
           ),
         ),
       );

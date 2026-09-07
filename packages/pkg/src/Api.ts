@@ -2,13 +2,30 @@ import * as Schema from "effect/Schema";
 import { Manifest } from "./Manifest.ts";
 
 /**
+ * Header naming the GitHub Actions run a request comes from, as
+ * `owner/repo#<run id>:<attempt>`. Sent on every request. When the job has
+ * an OIDC token it also sends `Authorization: Bearer <token>`, which must
+ * agree with the header; without one the registry verifies the run through
+ * the GitHub API and accepts it only for pull requests from forks.
+ */
+export const RUN_HEADER = "x-github-run";
+
+export const runHeader = (repo: string, runId: number, attempt: number) =>
+  `${repo}#${runId}:${attempt}`;
+
+export const parseRunHeader = (value: string) => {
+  const match = value.match(/^([^#\s]+\/[^#\s]+)#(\d+):(\d+)$/);
+  return match
+    ? { repo: match[1]!, runId: Number(match[2]), attempt: Number(match[3]) }
+    : undefined;
+};
+
+/**
  * `POST /api/publish`. Idempotent: the registry verifies the run, checks
  * every tarball is present, and either answers 409 with the missing ones or
  * writes the tags and answers 200.
  */
 export const PublishRequest = Schema.Struct({
-  /** The build run whose artifact is being published. */
-  runId: Schema.Number,
   manifest: Manifest,
 });
 export type PublishRequest = typeof PublishRequest.Type;

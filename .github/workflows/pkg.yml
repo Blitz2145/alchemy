@@ -1,10 +1,10 @@
-name: Package Preview Build
+name: Package Preview
 
-# Builds and packs every publishable workspace package into an artifact.
-# Nothing here talks to the registry: `pkg-publish.yml` picks the artifact up
-# on `workflow_run` and publishes it with the repository's OIDC identity.
-# Fork pull requests run here too, which is exactly why this job has no
-# permissions and no secrets.
+# Builds, packs, and publishes preview packages from the job that built them.
+# Same-repo runs prove themselves to the registry with the job's OIDC token.
+# Fork pull requests get no OIDC token from GitHub; for those the registry
+# verifies through the GitHub API that the named run is in progress on a
+# fork, and only ever tags under that run's own pull request.
 
 on:
   push:
@@ -18,7 +18,7 @@ on:
       - "pnpm-workspace.yaml"
       - "turbo.json"
       - "tsconfig.json"
-      - ".github/workflows/pkg-build.yml"
+      - ".github/workflows/pkg.yml"
   pull_request:
     paths:
       - "submodules/distilled"
@@ -29,25 +29,28 @@ on:
       - "pnpm-workspace.yaml"
       - "turbo.json"
       - "tsconfig.json"
-      - ".github/workflows/pkg-build.yml"
+      - ".github/workflows/pkg.yml"
 
-permissions: {}
+# id-token is only granted to same-repo runs; fork pull requests silently get
+# none and fall back to run verification.
+permissions:
+  contents: read
+  id-token: write
 
 concurrency:
-  group: pkg-build-${{ github.event.pull_request.number || github.ref }}
+  group: pkg-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  pack:
-    name: Pack preview packages
+  publish:
+    name: Publish preview packages
     runs-on: blacksmith-8vcpu-ubuntu-2404
     steps:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # Pack the pull request head rather than the synthetic merge commit,
-          # so every tarball is addressed by a commit that exists on the PR and
-          # the registry can verify it against the run.
+          # so every tarball is addressed by a commit that exists on the PR.
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
 
       - name: Checkout distilled
@@ -73,21 +76,9 @@ jobs:
         run: pnpm build:pkg
 
       # Keep the directory lists in sync with the `build:pkg` script.
-      - name: Pack packages
+      - name: Publish packages
         run: >-
-          bun packages/pkg/src/cli/bin.ts pack
+          bun packages/pkg/src/cli/bin.ts publish
           --group 'Alchemy=./packages/{alchemy,better-auth,cloudflare-runtime,frontend-frameworks,node-utils,floci,pkg}'
           --group 'Distilled=./submodules/distilled/packages/{core,aws,axiom,cloudflare,fly-io,hetzner,neon,planetscale,railway}'
           --registry https://staging.pkg.ing
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: pkg-preview
-          path: .pkg
-          # The output directory is dot-prefixed, which upload-artifact
-          # treats as hidden and skips by default.
-          include-hidden-files: true
-          if-no-files-found: error
-          # The registry holds the real copy; the artifact is only a hand-off.
-          retention-days: 1
