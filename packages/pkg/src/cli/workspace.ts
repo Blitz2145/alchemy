@@ -48,6 +48,42 @@ export const DependencySections = Schema.Struct({
   optionalDependencies: DependencyMap,
 });
 
+/**
+ * Order packages so every package comes after the packed packages it
+ * depends on, grouped into levels that can be packed concurrently. Fails on
+ * a cycle, since a tarball cannot link to a dependency that links back.
+ */
+export const dependencyLevels = (
+  dependencies: ReadonlyMap<string, ReadonlySet<string>>,
+): Effect.Effect<string[][], WorkspaceError> => {
+  const remaining = new Map(
+    [...dependencies].map(([name, deps]) => [
+      name,
+      new Set([...deps].filter((dep) => dependencies.has(dep))),
+    ]),
+  );
+  const levels: string[][] = [];
+  while (remaining.size > 0) {
+    const ready = [...remaining]
+      .filter(([, deps]) => deps.size === 0)
+      .map(([name]) => name)
+      .sort();
+    if (ready.length === 0) {
+      return Effect.fail(
+        new WorkspaceError({
+          message: `Dependency cycle among packed packages: ${[...remaining.keys()].sort().join(", ")}`,
+        }),
+      );
+    }
+    for (const name of ready) remaining.delete(name);
+    for (const deps of remaining.values()) {
+      for (const name of ready) deps.delete(name);
+    }
+    levels.push(ready);
+  }
+  return Effect.succeed(levels);
+};
+
 export interface WorkspacePackage {
   readonly name: string;
   readonly version: string;

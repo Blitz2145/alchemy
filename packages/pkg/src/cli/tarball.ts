@@ -20,18 +20,22 @@ const PnpmPackOutput = Schema.fromJsonString(
   Schema.Struct({ filename: Schema.String }),
 );
 
-/** `name@commit` install URL on the registry. */
-export const installUrl = (registry: string, name: string, commit: string) =>
-  `${registry.replace(/\/+$/, "")}/${name}@${commit}`;
+/**
+ * Immutable tarball URL on the registry. Dependencies between packed
+ * packages link to these, so a tarball's bytes depend only on its own
+ * source and its dependencies' bytes, never on a commit, and identical
+ * builds deduplicate across commits, pull requests, and repositories.
+ */
+export const tarballUrl = (registry: string, name: string, sha256: string) =>
+  `${registry.replace(/\/+$/, "")}/${name}/-/${sha256}.tgz`;
 
 /**
- * Rewrite every dependency on a package in `published` to its registry URL.
- * Returns the rewritten manifest text and the list of rewrites made.
+ * Rewrite every dependency on a package in `links` to that package's
+ * tarball URL. Returns the rewritten manifest text and the rewrites made.
  */
 export const rewriteDependencies = (
   manifestText: string,
-  published: ReadonlyMap<string, string>,
-  registry: string,
+  links: ReadonlyMap<string, string>,
 ) =>
   Effect.gen(function* () {
     const raw = yield* Effect.try({
@@ -49,9 +53,8 @@ export const rewriteDependencies = (
       if (deps === undefined) continue;
       const next: Record<string, string> = { ...deps };
       for (const name of Object.keys(deps)) {
-        const commit = published.get(name);
-        if (commit === undefined) continue;
-        const url = installUrl(registry, name, commit);
+        const url = links.get(name);
+        if (url === undefined) continue;
         next[name] = url;
         rewrites.push({ section, name, url });
       }
@@ -91,13 +94,13 @@ export interface PackedTarball {
 }
 
 /**
- * Pack one package with pnpm, rewrite its workspace dependencies to registry
- * URLs, and repack reproducibly into `outDir/file`.
+ * Pack one package with pnpm, rewrite its dependencies on already-packed
+ * packages to their tarball URLs, and repack reproducibly into `outDir/file`.
  */
 export const packPackage = Effect.fn("packPackage")(function* (options: {
   readonly absDir: string;
-  readonly published: ReadonlyMap<string, string>;
-  readonly registry: string;
+  /** Tarball URL of every already-packed dependency, by package name. */
+  readonly links: ReadonlyMap<string, string>;
   readonly outDir: string;
   readonly file: string;
 }) {
@@ -143,8 +146,7 @@ export const packPackage = Effect.fn("packPackage")(function* (options: {
     if (entry.header.name === "package/package.json") {
       const result = yield* rewriteDependencies(
         new TextDecoder().decode(data),
-        options.published,
-        options.registry,
+        options.links,
       ).pipe(
         Effect.mapError(
           (e) => new PackError({ dir: options.absDir, message: String(e) }),

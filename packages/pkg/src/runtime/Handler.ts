@@ -72,8 +72,9 @@ const ttlMillis = (policy: Policy) =>
   Duration.toMillis(policy.ttl ?? Duration.weeks(1));
 
 /**
- * Parse `/<name>@<tag>` and `/<name>/-/<sha256>.tgz`. Scoped names contain
- * one `/`; the tag may contain anything, including `/` and `:`.
+ * Parse `/<name>/<tag>` and `/<name>/-/<sha256>.tgz`. Scoped names take
+ * two segments; the tag is everything after the name and may itself contain
+ * `/` and `:`.
  */
 const parseInstallPath = (
   pathname: string,
@@ -93,13 +94,14 @@ const parseInstallPath = (
       sha256: tarball[2]!,
     };
   }
-  const at = path.startsWith("@") ? path.indexOf("@", 1) : path.indexOf("@");
-  if (at <= 0 || at === path.length - 1) return undefined;
-  return {
-    kind: "tag",
-    name: qualify(path.slice(0, at), scope),
-    tag: path.slice(at + 1),
-  };
+  const segments = path.split("/");
+  const nameLength = path.startsWith("@") ? 2 : 1;
+  const name = segments.slice(0, nameLength).join("/");
+  const tag = segments.slice(nameLength).join("/");
+  if (segments.length <= nameLength || name === "" || tag === "") {
+    return undefined;
+  }
+  return { kind: "tag", name: qualify(name, scope), tag };
 };
 
 const qualify = (name: string, scope: string | undefined) =>
@@ -143,7 +145,7 @@ const renderInstalls = (
       `### ${group}`,
       "",
       ...names.flatMap((name) => {
-        const url = `${origin}/${encodeName(name)}@${short}`;
+        const url = `${origin}/${encodeName(name)}/${short}`;
         return [
           `**${name}**`,
           "```sh",
@@ -367,7 +369,7 @@ export const make = (config: RegistryConfig) =>
           published.push({
             name: pkg.name,
             group: pkg.group,
-            url: `${origin}/${encodeName(pkg.name)}@${run.headSha.slice(0, SHORT)}`,
+            url: `${origin}/${encodeName(pkg.name)}/${run.headSha.slice(0, SHORT)}`,
             tags,
           });
         }
@@ -599,7 +601,7 @@ export const make = (config: RegistryConfig) =>
       if (url.pathname === "/") {
         return HttpServerResponse.text(
           "Preview package registry. Install with: bun add " +
-            `${origin}/<package>@<commit|branch:name|pr:N>\n`,
+            `${origin}/<package>/<commit|branch:name|pr:N>\n`,
         );
       }
       const target = parseInstallPath(url.pathname, scope);

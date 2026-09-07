@@ -2,7 +2,7 @@
 
 Preview packages for pull requests. A Cloudflare Worker registry that verifies every publication against the GitHub Actions run that produced it, plus the `pkg` CLI that packs workspace packages and publishes them from CI.
 
-Install URLs look like `https://pkg.ing/<name>@<tag>` where `<tag>` is a commit SHA, a short SHA, `branch:<name>`, or `pr:<number>`.
+Install URLs look like `https://pkg.ing/<name>/<tag>` where `<tag>` is a commit SHA, a short SHA, `branch:<name>`, or `pr:<number>`.
 
 ## How a publication flows
 
@@ -27,7 +27,7 @@ pkg pack \
 
 For each non-private package under a group's glob, `pack`:
 
-- runs `pnpm pack`, then rewrites every dependency on another packed package to `https://<registry>/<name>@<HEAD of the root repository>`, since the registry tags everything a run publishes with that run's commit;
+- packs in dependency order and rewrites every dependency on another packed package to that package's immutable tarball URL, `https://<registry>/<name>/-/<sha256>.tgz`, so a tarball's bytes depend only on its source and its dependencies' bytes and identical builds deduplicate across commits, pull requests, and repositories;
 - repacks with fixed timestamps and no ownership so identical inputs hash identically, letting the registry skip uploads it already has;
 - writes `pkg-manifest.json` describing each tarball's name, group, SHA-256, and size.
 
@@ -45,7 +45,7 @@ The Worker is configured with plain data, validated by the `Policy` schema expor
 }
 ```
 
-`repos` lists the repositories allowed to publish. A publication may contain any package; every package gets the commit, short commit, `branch:<name>`, and `pr:<number>` tags of the run that produced it, and nothing in the manifest can name a different commit. A package built from a submodule is therefore tagged with the publishing repository's commit, which is what the rewritten dependency URLs in the other tarballs point at.
+`repos` lists the repositories allowed to publish. A publication may contain any package; every package gets the commit, short commit, `branch:<name>`, and `pr:<number>` tags of the run that produced it, and nothing in the manifest can name a different commit. A package built from a submodule is therefore tagged with the publishing repository's commit; dependency links between tarballs use content URLs and do not involve commits at all.
 
 ## Cleanup
 

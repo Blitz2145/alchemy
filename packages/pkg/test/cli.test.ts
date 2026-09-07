@@ -4,8 +4,12 @@ import * as Schema from "effect/Schema";
 import * as Duration from "effect/Duration";
 import { manifestArtifactName, parseRunHeader, runHeader } from "../src/Api.ts";
 import { Policy } from "../src/Policy.ts";
-import { installUrl, rewriteDependencies } from "../src/cli/tarball.ts";
-import { expandBraces, parseGroup } from "../src/cli/workspace.ts";
+import { rewriteDependencies, tarballUrl } from "../src/cli/tarball.ts";
+import {
+  dependencyLevels,
+  expandBraces,
+  parseGroup,
+} from "../src/cli/workspace.ts";
 
 describe("Policy", () => {
   const policy = Schema.decodeUnknownSync(Policy)({
@@ -45,10 +49,41 @@ describe("workspace", () => {
 });
 
 describe("tarball", () => {
-  test("installUrl strips trailing slashes and keeps scopes", () => {
-    expect(installUrl("https://pkg.ing/", "@alchemy.run/pkg", "abc")).toBe(
-      "https://pkg.ing/@alchemy.run/pkg@abc",
+  test("tarballUrl strips trailing slashes and keeps scopes", () => {
+    expect(tarballUrl("https://pkg.ing/", "@alchemy.run/pkg", "abc")).toBe(
+      "https://pkg.ing/@alchemy.run/pkg/-/abc.tgz",
     );
+  });
+
+  test("dependencyLevels orders dependencies first and rejects cycles", async () => {
+    const levels = await Effect.runPromise(
+      dependencyLevels(
+        new Map([
+          ["alchemy", new Set(["core", "runtime", "outside"])],
+          ["runtime", new Set(["utils"])],
+          ["core", new Set()],
+          ["utils", new Set()],
+          ["better-auth", new Set(["alchemy"])],
+        ]),
+      ),
+    );
+    expect(levels).toEqual([
+      ["core", "utils"],
+      ["runtime"],
+      ["alchemy"],
+      ["better-auth"],
+    ]);
+    const cycle = await Effect.runPromise(
+      Effect.result(
+        dependencyLevels(
+          new Map([
+            ["a", new Set(["b"])],
+            ["b", new Set(["a"])],
+          ]),
+        ),
+      ),
+    );
+    expect(cycle._tag).toBe("Failure");
   });
 
   test("rewriteDependencies only touches published packages", async () => {
@@ -61,22 +96,27 @@ describe("tarball", () => {
       peerDependencies: { "@alchemy.run/frontend-frameworks": "2.0.0" },
       exports: { ".": "./src/index.ts" },
     });
-    const published = new Map([
-      ["@distilled.cloud/core", "d15t1ll3d"],
-      ["@alchemy.run/frontend-frameworks", "a1ch3my"],
+    const links = new Map([
+      [
+        "@distilled.cloud/core",
+        "https://pkg.ing/@distilled.cloud/core/-/aa.tgz",
+      ],
+      [
+        "@alchemy.run/frontend-frameworks",
+        "https://pkg.ing/@alchemy.run/frontend-frameworks/-/bb.tgz",
+      ],
     ]);
     const result = await Effect.runPromise(
-      rewriteDependencies(manifest, published, "https://pkg.ing"),
+      rewriteDependencies(manifest, links),
     );
     const rewritten = JSON.parse(result.text);
     expect(rewritten.dependencies).toEqual({
-      "@distilled.cloud/core":
-        "https://pkg.ing/@distilled.cloud/core@d15t1ll3d",
+      "@distilled.cloud/core": "https://pkg.ing/@distilled.cloud/core/-/aa.tgz",
       effect: "^4.0.0",
     });
     expect(rewritten.peerDependencies).toEqual({
       "@alchemy.run/frontend-frameworks":
-        "https://pkg.ing/@alchemy.run/frontend-frameworks@a1ch3my",
+        "https://pkg.ing/@alchemy.run/frontend-frameworks/-/bb.tgz",
     });
     expect(rewritten.exports).toEqual({ ".": "./src/index.ts" });
     expect(result.rewrites.map((r) => r.name).sort()).toEqual([

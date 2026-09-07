@@ -12,8 +12,15 @@ import {
 } from "../Manifest.ts";
 import { manifestArtifactName } from "../Api.ts";
 import * as Git from "./git.ts";
-import { packPackage } from "./tarball.ts";
-import { discover, WorkspaceError, type Group } from "./workspace.ts";
+import { packPackage, tarballUrl } from "./tarball.ts";
+import {
+  DEPENDENCY_SECTIONS,
+  DependencySections,
+  dependencyLevels,
+  discover,
+  WorkspaceError,
+  type Group,
+} from "./workspace.ts";
 
 const PullRequestEvent = Schema.fromJsonString(
   Schema.Struct({
@@ -75,42 +82,72 @@ export const pack = Effect.fn("pack")(function* (options: PackOptions) {
     return undefined;
   }
 
-  // The registry tags everything a run publishes with the run's head commit,
-  // packages inside submodules included, so every rewritten dependency points
-  // at the root repository's HEAD.
-  const published = new Map(packages.map((pkg) => [pkg.name, head]));
+  // Dependencies between packed packages are rewritten to the dependency's
+  // immutable tarball URL, so a package is packed only after everything it
+  // depends on has a hash.
+  const byName = new Map(packages.map((pkg) => [pkg.name, pkg]));
+  const dependencies = new Map<string, Set<string>>();
+  for (const pkg of packages) {
+    const manifest = yield* fs
+      .readFileString(path.join(pkg.absDir, "package.json"))
+      .pipe(
+        Effect.flatMap(
+          Schema.decodeUnknownEffect(Schema.fromJsonString(DependencySections)),
+        ),
+      );
+    dependencies.set(
+      pkg.name,
+      new Set(
+        DEPENDENCY_SECTIONS.flatMap((section) =>
+          Object.keys(manifest[section] ?? {}),
+        ).filter((name) => name !== pkg.name && byName.has(name)),
+      ),
+    );
+  }
+  const levels = yield* dependencyLevels(dependencies);
 
   const outDir = path.resolve(options.cwd, options.out);
   yield* fs.remove(outDir, { recursive: true, force: true });
   yield* fs.makeDirectory(outDir, { recursive: true });
 
-  const entries = yield* Effect.forEach(
-    packages,
-    Effect.fn(function* (pkg) {
-      const packed = yield* packPackage({
-        absDir: pkg.absDir,
-        published,
-        registry: options.registry,
-        outDir,
-        file: tarballFile(pkg.name),
-      }).pipe(Effect.scoped);
-      const lines = [
-        `${pkg.name}@${pkg.version} ${packed.sha256.slice(0, 12)} ${packed.size} bytes`,
-        ...packed.rewrites.map((r) => `  ${r.section}.${r.name} -> ${r.url}`),
-      ];
-      yield* Console.log(lines.join("\n"));
-      return {
-        name: pkg.name,
-        version: pkg.version,
-        dir: pkg.dir,
-        group: pkg.group,
-        file: packed.file,
-        sha256: packed.sha256,
-        size: packed.size,
-      } satisfies ManifestPackage;
-    }),
-    { concurrency: 4 },
-  );
+  const links = new Map<string, string>();
+  const entries: ManifestPackage[] = [];
+  for (const level of levels) {
+    const packedLevel = yield* Effect.forEach(
+      level,
+      Effect.fn(function* (name) {
+        const pkg = byName.get(name)!;
+        const packed = yield* packPackage({
+          absDir: pkg.absDir,
+          links,
+          outDir,
+          file: tarballFile(pkg.name),
+        }).pipe(Effect.scoped);
+        const lines = [
+          `${pkg.name}@${pkg.version} ${packed.sha256.slice(0, 12)} ${packed.size} bytes`,
+          ...packed.rewrites.map((r) => `  ${r.section}.${r.name} -> ${r.url}`),
+        ];
+        yield* Console.log(lines.join("\n"));
+        return {
+          name: pkg.name,
+          version: pkg.version,
+          dir: pkg.dir,
+          group: pkg.group,
+          file: packed.file,
+          sha256: packed.sha256,
+          size: packed.size,
+        } satisfies ManifestPackage;
+      }),
+      { concurrency: 4 },
+    );
+    for (const entry of packedLevel) {
+      links.set(
+        entry.name,
+        tarballUrl(options.registry, entry.name, entry.sha256),
+      );
+      entries.push(entry);
+    }
+  }
 
   const manifest: Manifest = {
     version: 1,
