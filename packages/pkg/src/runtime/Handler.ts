@@ -5,6 +5,7 @@ import * as Data from "effect/Data";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Encoding from "effect/Encoding";
+import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Redacted from "effect/Redacted";
 import * as Result from "effect/Result";
@@ -25,8 +26,10 @@ import {
 import { ManifestJson, type ManifestPackage } from "../Manifest.ts";
 import type { Policy } from "../Policy.ts";
 import {
+  APP_ID_ENV,
   COMMENT_MARKER,
   ORPHAN_GRACE_MS,
+  PRIVATE_KEY_ENV,
   SWEEP_LOOKAHEAD_MS,
   type RegistryConfig,
 } from "./Config.ts";
@@ -207,7 +210,10 @@ export const make = (config: RegistryConfig) =>
     const sql = yield* SQL.D1(d1);
     const http = yield* HttpClient.HttpClient;
     const policy = config.policy;
-    const maxSize = policy.maxPackageSize;
+    const maxSize =
+      policy.maxPackageSize === undefined
+        ? undefined
+        : FileSystem.Size(policy.maxPackageSize);
 
     // Isolate-scoped caches of plain values: the imported App key and the
     // runs recently confirmed in progress. Neither is I/O-backed.
@@ -216,13 +222,13 @@ export const make = (config: RegistryConfig) =>
 
     const github = Effect.gen(function* () {
       if (appKey === undefined) {
-        const pem = yield* Config.redacted(config.github.privateKeyEnv);
+        const pem = yield* Config.redacted(PRIVATE_KEY_ENV);
         appKey = yield* importPrivateKey(Redacted.value(pem));
       }
       return {
         http,
         apiUrl: config.github.apiUrl,
-        appId: yield* Config.string(config.github.appIdEnv),
+        appId: yield* Config.string(APP_ID_ENV),
         key: appKey,
       } satisfies GitHub.GitHubOptions;
     });
@@ -335,7 +341,7 @@ export const make = (config: RegistryConfig) =>
       });
 
     const validatePackage = (pkg: ManifestPackage) =>
-      maxSize !== undefined && pkg.size > maxSize
+      maxSize !== undefined && BigInt(pkg.size) > maxSize
         ? Effect.fail(
             new HttpError({
               status: 413,
@@ -458,7 +464,7 @@ export const make = (config: RegistryConfig) =>
             message: "Content-Length is required",
           });
         }
-        if (maxSize !== undefined && contentLength > maxSize) {
+        if (maxSize !== undefined && BigInt(contentLength) > maxSize) {
           return yield* new HttpError({
             status: 413,
             message: `tarball exceeds ${maxSize} bytes`,

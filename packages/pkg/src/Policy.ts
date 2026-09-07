@@ -18,8 +18,13 @@ export const Policy = Schema.Struct({
    * @default Duration.weeks(1)
    */
   ttl: Schema.optionalKey(Schema.Duration),
-  /** Upper bound on a single tarball, in bytes. Absent means unlimited. */
-  maxPackageSize: Schema.optionalKey(Schema.Number),
+  /**
+   * Upper bound on a single tarball as a `FileSystem.SizeInput`, e.g.
+   * `FileSystem.MiB(100)`. Absent means unlimited.
+   */
+  maxPackageSize: Schema.optionalKey(
+    Schema.Union([Schema.Number, Schema.BigInt]),
+  ),
 });
 export type Policy = typeof Policy.Type;
 export type PolicyInput = typeof Policy.Encoded;

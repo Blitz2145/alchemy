@@ -41,7 +41,7 @@ The Worker is configured with plain data, validated by the `Policy` schema expor
 {
   repos: ["alchemy-run/alchemy", "alchemy-run/distilled"],
   ttl: Duration.weeks(1),
-  maxPackageSize: 100 * 1024 * 1024,
+  maxPackageSize: FileSystem.MiB(100),
 }
 ```
 

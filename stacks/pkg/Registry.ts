@@ -1,5 +1,7 @@
 import { Registry } from "@alchemy.run/pkg";
+import * as Config from "effect/Config";
 import * as Duration from "effect/Duration";
+import * as FileSystem from "effect/FileSystem";
 
 /**
  * The preview package registry, currently on the staging host while the new
@@ -13,11 +15,13 @@ import * as Duration from "effect/Duration";
 export default Registry("Registry", {
   main: import.meta.url,
   domain: "staging.pkg.ing",
-  // Deploy-time variables, bound to the Worker under the same names.
-  github: { appId: "GH_APP_ID", privateKey: "GH_APP_PRIVATE_KEY" },
+  github: {
+    appId: Config.string("GH_APP_ID"),
+    privateKey: Config.redacted("GH_APP_PRIVATE_KEY"),
+  },
   policy: {
     repos: ["alchemy-run/alchemy", "alchemy-run/distilled"],
     ttl: Duration.weeks(1),
-    maxPackageSize: 100 * 1024 * 1024,
+    maxPackageSize: FileSystem.MiB(100),
   },
 });

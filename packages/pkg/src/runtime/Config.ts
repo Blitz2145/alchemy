@@ -16,15 +16,17 @@ export const RegistryConfig = Schema.Struct({
   aliases: Schema.Record(Schema.String, Schema.String),
   github: Schema.Struct({
     apiUrl: Schema.String,
-    /** Worker env var holding the GitHub App id. */
-    appIdEnv: Schema.String,
-    /** Worker secret env var holding the GitHub App private key PEM. */
-    privateKeyEnv: Schema.String,
   }),
   /** Cron expression for the expiry sweep. */
   cron: Schema.String,
 });
 export type RegistryConfig = typeof RegistryConfig.Type;
+
+/** Worker env var the GitHub App id is bound under. */
+export const APP_ID_ENV = "PKG_GITHUB_APP_ID";
+
+/** Worker secret env var the GitHub App private key PEM is bound under. */
+export const PRIVATE_KEY_ENV = "PKG_GITHUB_APP_PRIVATE_KEY";
 
 /** Marker that identifies the sticky install comment. */
 export const COMMENT_MARKER = "<!-- pkg-preview-comment -->";

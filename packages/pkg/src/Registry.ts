@@ -1,8 +1,13 @@
 import * as Cloudflare from "alchemy/Cloudflare";
 import * as Config from "effect/Config";
+import type * as Redacted from "effect/Redacted";
 import * as Schema from "effect/Schema";
 import type { PolicyInput } from "./Policy.ts";
-import { RegistryConfig } from "./runtime/Config.ts";
+import {
+  APP_ID_ENV,
+  PRIVATE_KEY_ENV,
+  RegistryConfig,
+} from "./runtime/Config.ts";
 import { make } from "./runtime/Handler.ts";
 
 export interface RegistryProps {
@@ -22,18 +27,12 @@ export interface RegistryProps {
    * serves `@distilled.cloud/core`.
    */
   readonly aliases?: Record<string, string>;
-  /**
-   * Names of the deploy-time variables holding the GitHub App credentials.
-   * Each is read with `Config` at deploy time and bound to the Worker under
-   * the same name, the id as a plain var and the key as a secret. The Worker
-   * re-reads its `env` inside the isolate, which is why the binding name and
-   * the Config key have to be one and the same string.
-   */
+  /** GitHub App credentials, read at deploy time and bound to the Worker. */
   readonly github: {
-    /** Variable holding the GitHub App id. */
-    readonly appId: string;
-    /** Variable holding the App's private key PEM. */
-    readonly privateKey: string;
+    /** The App id, e.g. `Config.string("GH_APP_ID")`. */
+    readonly appId: Config.Config<string>;
+    /** The App's private key PEM, e.g. `Config.redacted("GH_APP_PRIVATE_KEY")`. */
+    readonly privateKey: Config.Config<Redacted.Redacted<string>>;
     /** @default "https://api.github.com" */
     readonly apiUrl?: string;
   };
@@ -57,11 +56,14 @@ export interface RegistryProps {
  *   main: import.meta.url,
  *   domain: { name: "pkg.ing", aliases: ["pkg.distilled.cloud"] },
  *   aliases: { "pkg.distilled.cloud": "@distilled.cloud" },
- *   github: { appId: "GH_APP_ID", privateKey: "GH_APP_PRIVATE_KEY" },
+ *   github: {
+ *     appId: Config.string("GH_APP_ID"),
+ *     privateKey: Config.redacted("GH_APP_PRIVATE_KEY"),
+ *   },
  *   policy: {
  *     repos: ["alchemy-run/alchemy", "alchemy-run/distilled"],
  *     ttl: Duration.weeks(1),
- *     maxPackageSize: 100 * 1024 * 1024,
+ *     maxPackageSize: FileSystem.MiB(100),
  *   },
  * });
  * ```
@@ -97,8 +99,6 @@ export const Registry = <const Id extends string>(
     aliases: props.aliases ?? {},
     github: {
       apiUrl: props.github.apiUrl ?? "https://api.github.com",
-      appIdEnv: props.github.appId,
-      privateKeyEnv: props.github.privateKey,
     },
     cron: props.cron ?? "0 * * * *",
   });
@@ -108,9 +108,17 @@ export const Registry = <const Id extends string>(
       main: props.main,
       name: props.name,
       domain: props.domain,
+      // The Worker re-evaluates these props inside the isolate and re-reads
+      // each Config there, where only the bindings exist. Falling back to the
+      // binding's own name lets the caller's Config resolve from the deploy
+      // environment at deploy time and from the binding at runtime.
       env: {
-        [props.github.appId]: Config.string(props.github.appId),
-        [props.github.privateKey]: Config.redacted(props.github.privateKey),
+        [APP_ID_ENV]: Config.orElse(props.github.appId, () =>
+          Config.string(APP_ID_ENV),
+        ),
+        [PRIVATE_KEY_ENV]: Config.orElse(props.github.privateKey, () =>
+          Config.redacted(PRIVATE_KEY_ENV),
+        ),
       },
     },
     make(config),
